@@ -1,0 +1,174 @@
+from __future__ import annotations
+
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+class Route(str, Enum):
+    auto_accept = "AUTO_ACCEPT"
+    review = "REVIEW"
+    ambiguous = "AMBIGUOUS"
+    spec_gap = "SPEC_GAP"
+
+
+class RuleType(str, Enum):
+    definition = "definition"
+    boundary = "boundary"
+    priority = "priority"
+
+
+class LabelDefinition(BaseModel):
+    name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+
+
+class LabelsDocument(BaseModel):
+    labels: List[LabelDefinition] = Field(min_length=2)
+
+    @field_validator("labels")
+    @classmethod
+    def labels_are_unique(cls, value: List[LabelDefinition]) -> List[LabelDefinition]:
+        names = [item.name for item in value]
+        if len(names) != len(set(names)):
+            raise ValueError("标签名称必须唯一")
+        return value
+
+
+class DefinitionRule(BaseModel):
+    rule_id: str = Field(pattern=r"^D\d{3,}$")
+    label: str
+    definition: str = Field(min_length=1)
+    include: List[str] = Field(default_factory=list)
+    exclude: List[str] = Field(default_factory=list)
+    positive_examples: List[str] = Field(default_factory=list)
+    negative_examples: List[str] = Field(default_factory=list)
+
+
+class BoundaryRule(BaseModel):
+    rule_id: str = Field(pattern=r"^B\d{3,}$")
+    labels: List[str] = Field(min_length=2)
+    condition: str = Field(min_length=1)
+    decision: str = Field(min_length=1)
+
+    @field_validator("labels")
+    @classmethod
+    def boundary_labels_are_unique(cls, value: List[str]) -> List[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("Boundary Rule 中不能重复引用同一标签")
+        return value
+
+
+class PriorityRule(BaseModel):
+    rule_id: str = Field(pattern=r"^P\d{3,}$")
+    principle: str = Field(min_length=1)
+
+
+class DecisionRulesDocument(BaseModel):
+    boundary_rules: List[BoundaryRule] = Field(default_factory=list)
+    priority_rules: List[PriorityRule] = Field(default_factory=list)
+
+
+class CompiledStandard(BaseModel):
+    name: str = Field(min_length=1)
+    labels: LabelsDocument
+    definition_rules: List[DefinitionRule]
+    decision_rules: DecisionRulesDocument
+
+
+class ValidationIssue(BaseModel):
+    code: str
+    message: str
+    path: str = ""
+    severity: str = "error"
+
+
+class ValidationReport(BaseModel):
+    valid: bool
+    issues: List[ValidationIssue] = Field(default_factory=list)
+
+
+class ModelSettings(BaseModel):
+    compiler_model: str = "ernie-4.5-turbo-128k"
+    annotator_model: str = "ernie-4.5-turbo-128k"
+    verifier_model: str = "ernie-4.5-turbo-128k"
+    miner_model: str = "ernie-4.5-turbo-128k"
+    embedding_model: str = "Embedding-V1"
+    auto_accept_threshold: float = Field(default=0.85, ge=0, le=1)
+    spec_gap_min_cluster_size: int = Field(default=10, ge=2, le=10000)
+
+
+class CandidateDecision(BaseModel):
+    candidates: List[str] = Field(min_length=1, max_length=5)
+    rationale: str
+
+
+class RuleChecks(BaseModel):
+    definition_matched: bool
+    excludes_checked: bool
+    alternatives_checked: bool
+    boundaries_checked: bool
+    priorities_checked: bool
+    uniquely_decidable: bool
+
+
+class AnnotationDecision(BaseModel):
+    label: Optional[str] = None
+    rules_used: List[str] = Field(default_factory=list)
+    rule_reasons: Dict[str, str] = Field(default_factory=dict)
+    evidence: str
+    confidence: float = Field(ge=0, le=1)
+    ambiguous: bool = False
+    spec_gap: bool = False
+    needs_history: bool = False
+    missing_rule_reason: Optional[str] = None
+    checks: RuleChecks
+
+
+class VerificationDecision(BaseModel):
+    label_supported: bool
+    rules_exist: bool
+    definition_satisfied: bool
+    exclude_triggered: bool
+    omitted_boundary_rules: List[str] = Field(default_factory=list)
+    omitted_priority_rules: List[str] = Field(default_factory=list)
+    unsupported_rules: List[str] = Field(default_factory=list)
+    confidence: float = Field(ge=0, le=1)
+    verdict: str
+    explanation: str
+
+
+class DisclosureTrace(BaseModel):
+    label_map: List[LabelDefinition]
+    global_priority_rules: List[PriorityRule]
+    candidates: List[str]
+    definitions: List[DefinitionRule]
+    boundaries: List[BoundaryRule]
+    historical_cases: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class AnnotationResult(BaseModel):
+    item_id: str
+    text: str
+    label: Optional[str]
+    candidates: List[str]
+    rules_used: List[str]
+    rule_reasons: Dict[str, str]
+    evidence: str
+    confidence: float
+    route: Route
+    route_reasons: List[str]
+    disclosure: DisclosureTrace
+    verifier: VerificationDecision
+
+
+class MinerSuggestion(BaseModel):
+    title: str
+    labels: List[str]
+    rules: List[str]
+    typical_cases: List[str]
+    problem: str
+    target_rule_id: Optional[str] = None
+    proposed_change: str
+
