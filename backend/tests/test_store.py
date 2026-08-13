@@ -1,6 +1,6 @@
 import pytest
 
-from labelspec.store import StandardDeleteError
+from labelspec.store import DatasetDeleteError, StandardDeleteError
 
 from .factories import standard
 
@@ -15,6 +15,28 @@ def test_dataset_assigns_unique_internal_ids(store) -> None:
     by_text = {item["text"]: item for item in items}
     assert by_text["第一条"]["source_id"] is None
     assert by_text["第二条"]["source_id"] == "source-1"
+
+
+def test_dataset_can_be_deleted_before_annotation(store) -> None:
+    dataset = store.create_dataset("test", "test.csv", [{"text": "一条数据"}])
+    result = store.delete_dataset(dataset["id"])
+    assert result["deleted_items"] == 1
+    with pytest.raises(KeyError):
+        store.get_dataset(dataset["id"])
+
+
+def test_dataset_names_are_unique(store) -> None:
+    store.create_dataset("同名数据", "one.csv", [{"text": "第一条"}])
+    with pytest.raises(ValueError, match="已存在"):
+        store.create_dataset("同名数据", "two.csv", [{"text": "第二条"}])
+
+
+def test_dataset_delete_is_blocked_after_annotation_run(store) -> None:
+    dataset = store.create_dataset("test", "test.csv", [{"text": "一条数据"}])
+    saved = store.create_standard("source", standard(), status="archived")
+    store.create_run(dataset["id"], saved["id"])
+    with pytest.raises(DatasetDeleteError, match="标注运行"):
+        store.delete_dataset(dataset["id"])
 
 
 def test_standard_versions_are_immutable_snapshots(store) -> None:

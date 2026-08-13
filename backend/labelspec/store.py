@@ -17,6 +17,10 @@ class StandardDeleteError(ValueError):
     """Raised when deleting a standard would break an active or historical reference."""
 
 
+class DatasetDeleteError(ValueError):
+    """Raised when deleting a dataset would break annotation history."""
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -123,6 +127,8 @@ class Store:
                     filename TEXT,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_datasets_name_unique ON datasets(name);
 
                 CREATE TABLE IF NOT EXISTS data_items (
                     id TEXT PRIMARY KEY,
@@ -557,6 +563,9 @@ class Store:
     def create_dataset(
         self, name: str, filename: Optional[str], items: Iterable[Dict[str, Any]]
     ) -> Dict[str, Any]:
+        name = name.strip()
+        if not name:
+            raise ValueError("数据集名称不能为空")
         dataset_id = str(uuid.uuid4())
         now = utc_now()
         normalized = []
@@ -577,6 +586,9 @@ class Store:
         if not normalized:
             raise ValueError("数据集中没有有效的 text")
         with self.connect() as db:
+            existing = db.execute("SELECT 1 FROM datasets WHERE name = ? LIMIT 1", (name,)).fetchone()
+            if existing:
+                raise ValueError(f"数据集名称「{name}」已存在，请使用其他名称")
             db.execute(
                 "INSERT INTO datasets(id, name, filename, created_at) VALUES (?, ?, ?, ?)",
                 (dataset_id, name, filename, now),
@@ -588,6 +600,24 @@ class Store:
                 normalized,
             )
         return self.get_dataset(dataset_id)
+
+    def next_dataset_name(self, base_name: str) -> str:
+        """Return a dataset name that is unique in the workspace."""
+        base_name = base_name.strip() or "dataset"
+        with self.connect() as db:
+            existing = {
+                row["name"]
+                for row in db.execute(
+                    "SELECT name FROM datasets WHERE name = ? OR name LIKE ?",
+                    (base_name, f"{base_name} %"),
+                ).fetchall()
+            }
+        if base_name not in existing:
+            return base_name
+        index = 2
+        while f"{base_name} {index}" in existing:
+            index += 1
+        return f"{base_name} {index}"
 
     def list_datasets(self) -> List[Dict[str, Any]]:
         with self.connect() as db:
@@ -609,6 +639,25 @@ class Store:
         if not row:
             raise KeyError(f"Dataset {dataset_id} 不存在")
         return dict(row)
+
+    def delete_dataset(self, dataset_id: str) -> Dict[str, Any]:
+        """Delete a dataset only when it has never been used by an annotation run."""
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT id, name, filename FROM datasets WHERE id = ?", (dataset_id,)
+            ).fetchone()
+            if not row:
+                raise KeyError(f"Dataset {dataset_id} 不存在")
+            run = db.execute(
+                "SELECT id FROM annotation_runs WHERE dataset_id = ? LIMIT 1", (dataset_id,)
+            ).fetchone()
+            if run:
+                raise DatasetDeleteError("该数据集已用于标注运行，不能删除")
+            item_count = db.execute(
+                "SELECT COUNT(*) AS count FROM data_items WHERE dataset_id = ?", (dataset_id,)
+            ).fetchone()["count"]
+            db.execute("DELETE FROM datasets WHERE id = ?", (dataset_id,))
+        return {"id": dataset_id, "name": row["name"], "filename": row["filename"], "deleted_items": item_count}
 
     def list_items(self, dataset_id: str, ids: Optional[Sequence[str]] = None) -> List[Dict[str, Any]]:
         sql = "SELECT * FROM data_items WHERE dataset_id = ?"

@@ -12,6 +12,7 @@ import yaml
 from rich.console import Console
 from rich.table import Table
 
+from .api import _parse_upload
 from .api import app as api_app
 from .api import miner, provider, service, store
 from .domain import ModelSettings
@@ -127,15 +128,12 @@ def export_command(standard_id: str, output_dir: Path = Path("./compiled-standar
 
 @app.command("import-data")
 def import_data_command(path: Path = typer.Argument(..., exists=True), name: Optional[str] = None) -> None:
-    """Import CSV or JSONL data; every row receives an internal UUID."""
+    """Import CSV, XLSX, TXT, or JSONL data; every row receives an internal UUID."""
     store.initialize()
-    if path.suffix.lower() == ".csv":
-        with path.open(encoding="utf-8-sig", newline="") as stream:
-            items = list(csv.DictReader(stream))
-    elif path.suffix.lower() in {".jsonl", ".ndjson"}:
-        items = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    else:
-        raise typer.BadParameter("Only CSV and JSONL are supported")
+    try:
+        items = _parse_upload(path.name, path.read_bytes())
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     console.print_json(data=store.create_dataset(name or path.stem, path.name, items))
 
 
@@ -248,7 +246,9 @@ def demo_data_command() -> None:
     store.initialize()
     path = Path(__file__).parent / "demo" / "data.csv"
     with path.open(encoding="utf-8-sig", newline="") as stream:
-        result = store.create_dataset("金融与汽车演示数据", path.name, list(csv.DictReader(stream)))
+        result = store.create_dataset(
+            store.next_dataset_name("金融与汽车演示数据"), path.name, list(csv.DictReader(stream))
+        )
     console.print_json(data=result)
 
 

@@ -329,12 +329,38 @@ function DatasetsPage({ datasets, standards, refresh, notify, setPage }: { datas
   useEffect(() => { if (selectedId) void api.datasetItems(selectedId).then(setItems).catch(error => notify(error.message, true)) }, [selectedId, notify])
   async function upload() { if (!file) return; setBusy(true); try { const result = await api.uploadDataset(file, datasetName); notify(`已导入 ${result.item_count} 条数据`); await refresh(); setSelectedId(result.id); setFile(null) } catch (error) { notify(error instanceof Error ? error.message : '上传失败', true) } finally { setBusy(false) } }
   async function demo() { setBusy(true); try { const result = await api.createDemoDataset(); notify(`已导入 ${result.item_count} 条演示数据`); await refresh(); setSelectedId(result.id) } catch (error) { notify(error instanceof Error ? error.message : '导入失败', true) } finally { setBusy(false) } }
+  async function removeDataset(dataset: Dataset) {
+    if (!window.confirm(`确定删除「${dataset.name}」吗？\n\n未使用过的数据集可以删除；已有标注运行的数据集会被系统拒绝。`)) return
+    setBusy(true)
+    try {
+      await api.deleteDataset(dataset.id)
+      const remaining = datasets.filter(item => item.id !== dataset.id)
+      setSelectedId(remaining[0]?.id || '')
+      setItems([])
+      await refresh()
+      notify(`已删除 ${dataset.name}`)
+    } catch (error) { notify(error instanceof Error ? error.message : '删除数据集失败', true) } finally { setBusy(false) }
+  }
+  async function downloadTemplate() {
+    try {
+      const content = await api.datasetTemplate()
+      const blob = new Blob([`\ufeff${content}`], { type: 'text/csv;charset=utf-8' })
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = 'dataset-template.csv'
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(url)
+    } catch (error) { notify(error instanceof Error ? error.message : '获取数据模板失败', true) }
+  }
   async function start() { if (!selectedId || !standardId) return; setBusy(true); try { await api.createRun(selectedId, standardId); notify('标注运行已创建'); await refresh(); setPage('runs') } catch (error) { notify(error instanceof Error ? error.message : '创建运行失败', true) } finally { setBusy(false) } }
   return <>
-    <PageHead title="数据集" meta={`${datasets.reduce((sum, item) => sum + item.item_count, 0)} 条数据`}><button className="btn" disabled={busy} onClick={() => void demo()}><FlaskConical size={15} />导入演示数据</button></PageHead>
-    <div className="panel" style={{ marginBottom: 16 }}><div className="panel-body"><div className="field-row" style={{ gridTemplateColumns: '1fr 1fr auto' }}><div className="field"><label>CSV / JSONL</label><input className="input" type="file" accept=".csv,.jsonl,.ndjson" onChange={event => setFile(event.target.files?.[0] || null)} /></div><div className="field"><label>数据集名称</label><input className="input" value={datasetName} placeholder={file?.name.replace(/\.[^.]+$/, '') || ''} onChange={event => setDatasetName(event.target.value)} /></div><button className="btn primary" style={{ alignSelf: 'end' }} disabled={!file || busy} onClick={() => void upload()}>{busy ? <Spinner /> : <Upload size={15} />}导入</button></div></div></div>
+    <PageHead title="数据集" meta={`${datasets.reduce((sum, item) => sum + item.item_count, 0)} 条数据`}><div className="actions"><button className="btn ghost" onClick={() => void downloadTemplate()} title="下载 CSV 数据模板"><FileDown size={15} />数据模板</button><button className="btn" disabled={busy} onClick={() => void demo()}><FlaskConical size={15} />导入演示数据</button></div></PageHead>
+    <div className="panel" style={{ marginBottom: 16 }}><div className="panel-body"><div className="field-row dataset-upload-grid"><div className="field"><label>数据文件</label><input className="input" type="file" accept=".csv,.xlsx,.txt,.jsonl,.ndjson" onChange={event => setFile(event.target.files?.[0] || null)} /></div><div className="field"><label>数据集名称</label><input className="input" value={datasetName} placeholder={file?.name.replace(/\.[^.]+$/, '') || ''} onChange={event => setDatasetName(event.target.value)} /></div><button className="btn primary" style={{ alignSelf: 'end' }} disabled={!file || busy} onClick={() => void upload()}>{busy ? <Spinner /> : <Upload size={15} />}导入</button></div><div className="hint dataset-upload-hint">推荐 CSV；模板包含 text 和可选 gold_label，TXT 每行一条 text</div><div className="dataset-format-help"><strong>字段说明：</strong><code>text</code> 是待分类文本；<code>gold_label</code> 是可选的人工真实标签，用于评估和规则改进。模板中的 <code>gold_label</code> 可以留空。</div></div></div>
     <div className="split">
-      <div className="panel">{datasets.length ? <div className="list">{datasets.map(item => <button key={item.id} className={`list-item ${selectedId === item.id ? 'selected' : ''}`} onClick={() => setSelectedId(item.id)}><div className="list-title">{item.name}</div><div className="list-meta"><span>{item.item_count} Cases</span><span>{item.filename || '内置数据'}</span><span>{date(item.created_at)}</span></div></button>)}</div> : <Empty icon={Database} title="暂无数据集" />}</div>
+      <div className="panel">{datasets.length ? <div className="list">{datasets.map(item => <div className={`list-item dataset-list-item ${selectedId === item.id ? 'selected' : ''}`} key={item.id} onClick={() => setSelectedId(item.id)}><div><div className="list-title">{item.name}</div><div className="list-meta"><span>{item.item_count} Cases</span><span>{item.filename || '内置数据'}</span><span>{date(item.created_at)}</span></div></div><button className="btn icon danger" disabled={busy} onClick={event => { event.stopPropagation(); void removeDataset(item) }} title="删除数据集"><Trash2 size={15} /></button></div>)}</div> : <Empty icon={Database} title="暂无数据集" />}</div>
       <div className="stack">
         <div className="panel"><div className="panel-head"><h2>创建标注运行</h2></div><div className="panel-body"><div className="field-row"><div className="field"><label>当前数据集</label><select className="select" value={selectedId} onChange={event => setSelectedId(event.target.value)}><option value="">选择数据集</option>{datasets.map(item => <option key={item.id} value={item.id}>{item.name} · {item.item_count}</option>)}</select></div><div className="field"><label>Standard</label><select className="select" value={standardId} onChange={event => setStandardId(event.target.value)}><option value="">选择已激活版本</option>{standards.filter(item => item.status === 'active').map(item => <option key={item.id} value={item.id}>{item.name} v{item.version}</option>)}</select></div></div><div className="actions" style={{ marginTop: 14, justifyContent: 'flex-end' }}><button className="btn primary" disabled={!selectedId || !standardId || busy} onClick={() => void start()}>{busy ? <Spinner /> : <Play size={15} />}开始标注</button></div></div></div>
         <div className="panel"><div className="panel-head"><h2>数据预览</h2><span className="hint">内部 ID 已生成</span></div>{items.length ? <div className="table-wrap" style={{ maxHeight: 470 }}><table><thead><tr><th>ID</th><th>文本</th><th>Gold Label</th></tr></thead><tbody>{items.map(item => <tr key={item.id}><td><span className="rule-chip">{item.id.slice(0, 8)}</span></td><td className="text-cell">{item.text}</td><td>{item.gold_label || '-'}</td></tr>)}</tbody></table></div> : <Empty title="选择数据集查看内容" />}</div>

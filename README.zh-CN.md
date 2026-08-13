@@ -91,6 +91,14 @@ labelspec export-results <run-id> results.jsonl --gold-only
 
 Web 工作台内置金融/汽车演示标准和 CSV 数据。导入演示数据不会绕过模型 API Key 要求。
 
+### 数据集格式
+
+Web 和 CLI 的数据集导入支持 CSV、XLSX、TXT、JSONL/NDJSON，推荐使用 CSV。CSV/XLSX 的表头必须包含 `text`，可选 `gold_label`；JSONL 每行必须是包含 `text` 的对象；TXT 每行作为一条 `text`，不支持 `gold_label`。系统会自动为每条记录生成内部 ID，用户无需填写 `id`。其他字段会保存在 metadata 中。
+
+Web 数据页提供一个包含 `text,gold_label` 表头的 CSV 模板；`gold_label` 可以留空。`text` 是待分类文本，`gold_label` 是可选的人工真实标签，用于评估和规则改进。
+
+未创建过标注运行的数据集可以在 Web 界面删除；已有标注运行的数据集为保留历史记录不能删除。
+
 ## 数据与费用
 
 业务标准和待标注文本会发送给用户配置的千帆模型。处理生产或敏感数据前，请确认千帆平台的数据、保留、配额和计费政策。本地工作数据默认保存在 `backend/data/labelspec.db`。

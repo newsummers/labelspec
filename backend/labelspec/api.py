@@ -21,7 +21,7 @@ from .domain import ModelSettings
 from .miner import SpecGapMiner
 from .provider import MissingApiKeyError, ProviderError, QianfanProvider
 from .service import LabelSpecService
-from .store import StandardDeleteError, Store
+from .store import DatasetDeleteError, StandardDeleteError, Store
 from .validator import validate_standard
 from .yaml_io import standard_to_yaml_files
 from .taxonomy import parse_compiled_standard
@@ -97,6 +97,8 @@ def _handle_error(exc: Exception) -> HTTPException:
     if isinstance(exc, ProviderError):
         return HTTPException(status_code=502, detail=str(exc))
     if isinstance(exc, StandardDeleteError):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, DatasetDeleteError):
         return HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, KeyError):
         return HTTPException(status_code=404, detail=str(exc).strip("'"))
@@ -188,7 +190,7 @@ def create_demo_dataset() -> Dict[str, Any]:
     path = Path(__file__).parent / "demo" / "data.csv"
     with path.open(encoding="utf-8-sig", newline="") as stream:
         items = list(csv.DictReader(stream))
-    return store.create_dataset("金融与汽车演示数据", path.name, items)
+    return store.create_dataset(store.next_dataset_name("金融与汽车演示数据"), path.name, items)
 
 
 @app.post("/api/standards/compile")
@@ -305,11 +307,51 @@ def create_manual_standard_version(
 
 
 def _parse_upload(filename: str, content: bytes) -> List[Dict[str, Any]]:
-    text = content.decode("utf-8-sig")
     suffix = Path(filename).suffix.lower()
+    if suffix == ".txt":
+        text = _decode_upload_text(content)
+        return [{"text": line.strip()} for line in text.splitlines() if line.strip()]
     if suffix == ".csv":
-        return list(csv.DictReader(io.StringIO(text)))
+        text = _decode_upload_text(content)
+        reader = csv.DictReader(io.StringIO(text))
+        headers = [str(header or "").strip() for header in (reader.fieldnames or [])]
+        if "text" not in headers:
+            raise ValueError("CSV 必须包含 text 表头")
+        return [
+            {
+                str(key or "").strip(): value
+                for key, value in row.items()
+                if str(key or "").strip()
+            }
+            for row in reader
+        ]
+    if suffix == ".xlsx":
+        try:
+            from openpyxl import load_workbook
+        except ImportError as exc:  # pragma: no cover
+            raise ValueError("服务端未安装 XLSX 解析依赖 openpyxl") from exc
+        workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        rows: List[Dict[str, Any]] = []
+        for sheet in workbook.worksheets:
+            values = list(sheet.iter_rows(values_only=True))
+            if not values:
+                continue
+            headers = [str(value or "").strip() for value in values[0]]
+            while headers and not headers[-1]:
+                headers.pop()
+            if "text" not in headers:
+                raise ValueError(f"XLSX 工作表「{sheet.title}」必须包含 text 表头")
+            for values_row in values[1:]:
+                row = {
+                    header: value
+                    for header, value in zip(headers, values_row)
+                    if header
+                }
+                if any(str(value or "").strip() for value in row.values()):
+                    rows.append(row)
+        return rows
     if suffix in {".jsonl", ".ndjson"}:
+        text = _decode_upload_text(content)
         rows = []
         for line_number, line in enumerate(text.splitlines(), start=1):
             if not line.strip():
@@ -320,9 +362,30 @@ def _parse_upload(filename: str, content: bytes) -> List[Dict[str, Any]]:
                 raise ValueError(f"JSONL 第 {line_number} 行无效: {exc}") from exc
             if not isinstance(value, dict):
                 raise ValueError(f"JSONL 第 {line_number} 行必须是对象")
+            if "text" not in value:
+                raise ValueError(f"JSONL 第 {line_number} 行缺少 text 字段")
             rows.append(value)
         return rows
-    raise ValueError("仅支持 .csv、.jsonl 或 .ndjson 文件")
+    raise ValueError("仅支持 .csv、.xlsx、.txt、.jsonl 或 .ndjson 文件")
+
+
+def _decode_upload_text(content: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("文本文件编码无法识别，请使用 UTF-8 或 GB18030")
+
+
+@app.get("/api/datasets/template")
+def dataset_template() -> Response:
+    content = "text,gold_label\n示例文本,\n"
+    return Response(
+        content=content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="dataset-template.csv"'},
+    )
 
 
 @app.post("/api/datasets")
@@ -333,6 +396,14 @@ async def upload_dataset(
         content = await file.read()
         items = _parse_upload(file.filename or "", content)
         return store.create_dataset(name or Path(file.filename or "dataset").stem, file.filename, items)
+    except Exception as exc:
+        raise _handle_error(exc) from exc
+
+
+@app.delete("/api/datasets/{dataset_id}")
+def delete_dataset(dataset_id: str) -> Dict[str, Any]:
+    try:
+        return store.delete_dataset(dataset_id)
     except Exception as exc:
         raise _handle_error(exc) from exc
 

@@ -42,6 +42,12 @@ export const api = {
   revise: (id: string, payload: unknown) => request<{ standard: StandardSummary; affected_labels: string[] }>(`/api/standards/${id}/revise`, { method: 'POST', body: JSON.stringify(payload) }),
   datasets: () => request<Dataset[]>('/api/datasets'),
   datasetItems: (id: string) => request<Array<{ id: string; source_id?: string; text: string; gold_label?: string }>>(`/api/datasets/${id}/items`),
+  deleteDataset: (id: string) => request<{ id: string; name: string; filename?: string; deleted_items: number }>(`/api/datasets/${id}`, { method: 'DELETE' }),
+  datasetTemplate: async () => {
+    const response = await fetch(`${base}/api/datasets/template`)
+    if (!response.ok) throw new Error('获取数据模板失败')
+    return response.text()
+  },
   uploadDataset: (file: File, name: string) => {
     const form = new FormData(); form.append('file', file); if (name) form.append('name', name)
     return request<Dataset>('/api/datasets', { method: 'POST', body: form })
