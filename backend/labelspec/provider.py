@@ -36,7 +36,9 @@ class QianfanProvider:
         }
 
     async def list_models(self) -> List[Dict[str, Any]]:
-        async with httpx.AsyncClient(timeout=30) as client:
+        # Do not impose a client-side deadline. If Qianfan cannot complete the
+        # request, return its actual response or transport error to the caller.
+        async with httpx.AsyncClient(timeout=None) as client:
             try:
                 response = await client.get(
                     f"{self.settings.qianfan_base_url.rstrip('/')}/models",
@@ -126,7 +128,7 @@ class QianfanProvider:
         if not inputs:
             return []
         vectors: List[List[float]] = []
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=None) as client:
             for start in range(0, len(inputs), 16):
                 batch = inputs[start : start + 16]
                 try:
@@ -145,7 +147,10 @@ class QianfanProvider:
         return vectors
 
     async def _chat(self, payload: Dict[str, Any]) -> str:
-        async with httpx.AsyncClient(timeout=180) as client:
+        # Large structured compilations can legitimately take several minutes.
+        # An unlimited timeout lets the provider decide whether the request can
+        # be completed instead of truncating it locally at an arbitrary limit.
+        async with httpx.AsyncClient(timeout=None) as client:
             try:
                 response = await client.post(
                     f"{self.settings.qianfan_base_url.rstrip('/')}/chat/completions",
@@ -184,4 +189,5 @@ class QianfanProvider:
             except ValueError:
                 detail = exc.response.text[:500]
             return f"{prefix} ({exc.response.status_code}): {detail}"
-        return f"{prefix}: {exc}"
+        detail = str(exc).strip() or exc.__class__.__name__
+        return f"{prefix}: {detail}"

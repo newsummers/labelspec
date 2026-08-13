@@ -4,7 +4,7 @@ import asyncio
 import csv
 import json
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import typer
 import uvicorn
@@ -14,7 +14,9 @@ from rich.table import Table
 
 from .api import app as api_app
 from .api import miner, provider, service, store
-from .domain import CompiledStandard, DecisionRulesDocument, LabelsDocument, ModelSettings
+from .domain import ModelSettings
+from .documents import parse_standard_document
+from .taxonomy import parse_compiled_standard
 from .validator import validate_standard
 from .yaml_io import standard_to_yaml_files
 
@@ -57,13 +59,17 @@ def settings_command(
 
 @app.command("compile")
 def compile_command(
-    standard_md: Path = typer.Argument(..., exists=True, readable=True),
+    standard_files: List[Path] = typer.Argument(..., exists=True, readable=True),
     name: str = typer.Option(..., "--name", "-n"),
     output_dir: Optional[Path] = typer.Option(None, "--output", "-o"),
 ) -> None:
     """Compile a Markdown standard with the configured Qianfan model."""
     store.initialize()
-    result = asyncio.run(service.compile(name, standard_md.read_text(encoding="utf-8")))
+    documents = [
+        parse_standard_document(path.name, "application/octet-stream", path.read_bytes())
+        for path in standard_files
+    ]
+    result = asyncio.run(service.compile_documents(name, documents))
     if output_dir:
         output_dir.mkdir(parents=True, exist_ok=True)
         for filename, content in result["files"].items():
@@ -80,11 +86,15 @@ def validate_command(
     name: str = "Imported Standard",
 ) -> None:
     """Validate three compiled YAML files without calling a model."""
-    standard = CompiledStandard(
-        name=name,
-        labels=LabelsDocument.model_validate(yaml.safe_load(labels_yaml.read_text(encoding="utf-8"))),
-        definition_rules=yaml.safe_load(definitions_yaml.read_text(encoding="utf-8")),
-        decision_rules=DecisionRulesDocument.model_validate(yaml.safe_load(decisions_yaml.read_text(encoding="utf-8"))),
+    standard = parse_compiled_standard(
+        {
+            "schema_version": "0.2",
+            "name": name,
+            "labels": yaml.safe_load(labels_yaml.read_text(encoding="utf-8")),
+            "definition_rules": yaml.safe_load(definitions_yaml.read_text(encoding="utf-8")),
+            "decision_rules": yaml.safe_load(decisions_yaml.read_text(encoding="utf-8")),
+            "conflicts": [],
+        }
     )
     report = validate_standard(standard)
     console.print_json(data=report.model_dump())
@@ -97,7 +107,7 @@ def activate_command(standard_id: str) -> None:
     """Activate a validated Standard version."""
     store.initialize()
     standard = store.get_standard(standard_id)
-    report = validate_standard(CompiledStandard.model_validate(standard["compiled"]))
+    report = validate_standard(parse_compiled_standard(standard["compiled"]))
     if not report.valid:
         console.print_json(data=report.model_dump())
         raise typer.Exit(1)
@@ -108,7 +118,7 @@ def activate_command(standard_id: str) -> None:
 def export_command(standard_id: str, output_dir: Path = Path("./compiled-standard")) -> None:
     """Export a Standard snapshot as labels/definition/decision YAML files."""
     store.initialize()
-    standard = CompiledStandard.model_validate(store.get_standard(standard_id)["compiled"])
+    standard = parse_compiled_standard(store.get_standard(standard_id)["compiled"])
     output_dir.mkdir(parents=True, exist_ok=True)
     for filename, content in standard_to_yaml_files(standard).items():
         (output_dir / filename).write_text(content, encoding="utf-8")

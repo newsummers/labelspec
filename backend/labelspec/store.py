@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -9,6 +10,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 
 from .domain import CompiledStandard, ModelSettings
+from .taxonomy import label_path, leaf_ids, parse_compiled_standard, upgrade_compiled_payload
+
+
+class StandardDeleteError(ValueError):
+    """Raised when deleting a standard would break an active or historical reference."""
 
 
 def utc_now() -> str:
@@ -62,6 +68,41 @@ class Store:
                     change_summary TEXT,
                     created_at TEXT NOT NULL,
                     UNIQUE(name, version)
+                );
+                CREATE TABLE IF NOT EXISTS standard_families (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS source_documents (
+                    id TEXT PRIMARY KEY,
+                    filename TEXT NOT NULL,
+                    media_type TEXT NOT NULL,
+                    sha256 TEXT NOT NULL UNIQUE,
+                    raw_content BLOB NOT NULL,
+                    extracted_text TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS standard_version_sources (
+                    standard_id TEXT NOT NULL REFERENCES standards(id),
+                    document_id TEXT NOT NULL REFERENCES source_documents(id),
+                    ordinal INTEGER NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'auto',
+                    PRIMARY KEY (standard_id, document_id)
+                );
+                CREATE TABLE IF NOT EXISTS standard_changes (
+                    id TEXT PRIMARY KEY,
+                    from_standard_id TEXT REFERENCES standards(id),
+                    to_standard_id TEXT NOT NULL REFERENCES standards(id),
+                    operation TEXT NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    entity_id TEXT,
+                    before_json TEXT,
+                    after_json TEXT,
+                    reason TEXT,
+                    origin TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS rule_changes (
@@ -153,8 +194,40 @@ class Store:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(item_id, model)
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_standard_sources_version ON standard_version_sources(standard_id);
+                CREATE INDEX IF NOT EXISTS idx_standard_changes_version ON standard_changes(to_standard_id);
                 """
             )
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(standards)")}
+            if "family_id" not in columns:
+                db.execute("ALTER TABLE standards ADD COLUMN family_id TEXT")
+            source_columns = {row["name"] for row in db.execute("PRAGMA table_info(standard_version_sources)")}
+            if "role" not in source_columns:
+                db.execute("ALTER TABLE standard_version_sources ADD COLUMN role TEXT NOT NULL DEFAULT 'auto'")
+
+            for row in db.execute("SELECT DISTINCT name FROM standards WHERE family_id IS NULL"):
+                family_id = str(uuid.uuid4())
+                db.execute(
+                    "INSERT OR IGNORE INTO standard_families (id, name, created_at) VALUES (?, ?, ?)",
+                    (family_id, row["name"], utc_now()),
+                )
+                family = db.execute(
+                    "SELECT id FROM standard_families WHERE name = ?", (row["name"],)
+                ).fetchone()
+                db.execute(
+                    "UPDATE standards SET family_id = ? WHERE name = ? AND family_id IS NULL",
+                    (family["id"], row["name"]),
+                )
+
+            for row in db.execute("SELECT id, compiled_json FROM standards"):
+                payload = _loads(row["compiled_json"])
+                upgraded = upgrade_compiled_payload(payload)
+                if upgraded != payload:
+                    db.execute(
+                        "UPDATE standards SET compiled_json = ? WHERE id = ?",
+                        (_json(upgraded), row["id"]),
+                    )
             existing = db.execute("SELECT id FROM settings WHERE id = 1").fetchone()
             if not existing:
                 db.execute(
@@ -182,18 +255,42 @@ class Store:
         status: str = "draft",
         parent_id: Optional[str] = None,
         change_summary: Optional[str] = None,
+        family_id: Optional[str] = None,
+        source_document_ids: Sequence[str] = (),
+        source_document_roles: Sequence[str] = (),
+        changes: Sequence[Dict[str, Any]] = (),
+        origin: str = "ai_compile",
     ) -> Dict[str, Any]:
         standard_id = str(uuid.uuid4())
         with self.connect() as db:
+            if family_id:
+                family = db.execute(
+                    "SELECT id FROM standard_families WHERE id = ?", (family_id,)
+                ).fetchone()
+                if not family:
+                    raise KeyError(f"Standard family {family_id} 不存在")
+            else:
+                family = db.execute(
+                    "SELECT id FROM standard_families WHERE name = ?", (standard.name,)
+                ).fetchone()
+                if family:
+                    family_id = family["id"]
+                else:
+                    family_id = str(uuid.uuid4())
+                    db.execute(
+                        "INSERT INTO standard_families (id, name, created_at) VALUES (?, ?, ?)",
+                        (family_id, standard.name, utc_now()),
+                    )
             row = db.execute(
-                "SELECT COALESCE(MAX(version), 0) AS version FROM standards WHERE name = ?",
-                (standard.name,),
+                "SELECT COALESCE(MAX(version), 0) AS version FROM standards WHERE family_id = ?",
+                (family_id,),
             ).fetchone()
             version = int(row["version"]) + 1
             db.execute(
                 """INSERT INTO standards
-                   (id, name, version, status, source_markdown, compiled_json, parent_id, change_summary, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (id, name, version, status, source_markdown, compiled_json, parent_id,
+                    change_summary, created_at, family_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     standard_id,
                     standard.name,
@@ -204,16 +301,46 @@ class Store:
                     parent_id,
                     change_summary,
                     utc_now(),
+                    family_id,
                 ),
             )
+            roles = list(source_document_roles)
+            if roles and len(roles) != len(source_document_ids):
+                raise ValueError("标准文档角色数量必须与文档数量一致")
+            for ordinal, document_id in enumerate(source_document_ids):
+                db.execute(
+                    """INSERT INTO standard_version_sources (standard_id, document_id, ordinal, role)
+                       VALUES (?, ?, ?, ?)""",
+                    (standard_id, document_id, ordinal, roles[ordinal] if roles else "auto"),
+                )
+            for change in changes:
+                db.execute(
+                    """INSERT INTO standard_changes
+                       (id, from_standard_id, to_standard_id, operation, entity_type,
+                        entity_id, before_json, after_json, reason, origin, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        str(uuid.uuid4()),
+                        parent_id,
+                        standard_id,
+                        change["operation"],
+                        change["entity_type"],
+                        change.get("entity_id"),
+                        _json(change["before"]) if change.get("before") is not None else None,
+                        _json(change["after"]) if change.get("after") is not None else None,
+                        change.get("reason") or change_summary,
+                        change.get("origin") or origin,
+                        utc_now(),
+                    ),
+                )
         return self.get_standard(standard_id)
 
     def activate_standard(self, standard_id: str) -> Dict[str, Any]:
         standard = self.get_standard(standard_id)
         with self.connect() as db:
             db.execute(
-                "UPDATE standards SET status = 'archived' WHERE name = ? AND status = 'active'",
-                (standard["name"],),
+                "UPDATE standards SET status = 'archived' WHERE family_id = ? AND status = 'active'",
+                (standard["family_id"],),
             )
             db.execute("UPDATE standards SET status = 'active' WHERE id = ?", (standard_id,))
         return self.get_standard(standard_id)
@@ -232,19 +359,125 @@ class Store:
             raise KeyError(f"Standard {standard_id} 不存在")
         return self._standard_row(row, include_source=True)
 
+    def delete_standard(self, standard_id: str) -> Dict[str, Any]:
+        """Delete a removable standard version and its unreferenced source documents.
+
+        A standard is an immutable historical snapshot.  Deletion is therefore
+        deliberately conservative: active versions, versions with descendants,
+        and versions used by annotation runs cannot be removed.
+        """
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT id, name, version, status, family_id FROM standards WHERE id = ?",
+                (standard_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError(f"Standard {standard_id} 不存在")
+            if row["status"] == "active":
+                raise StandardDeleteError("已激活的 Standard 不能删除")
+
+            child = db.execute(
+                "SELECT id, version FROM standards WHERE parent_id = ? LIMIT 1",
+                (standard_id,),
+            ).fetchone()
+            if child:
+                raise StandardDeleteError(
+                    f"该 Standard 已被 v{child['version']} 作为父版本引用，不能删除"
+                )
+
+            run = db.execute(
+                "SELECT id FROM annotation_runs WHERE standard_id = ? LIMIT 1",
+                (standard_id,),
+            ).fetchone()
+            if run:
+                raise StandardDeleteError("该 Standard 已用于标注运行，不能删除")
+
+            source_rows = db.execute(
+                "SELECT document_id FROM standard_version_sources WHERE standard_id = ?",
+                (standard_id,),
+            ).fetchall()
+            document_ids = [item["document_id"] for item in source_rows]
+
+            # Remove dependent history/link rows before removing the snapshot.
+            changes = db.execute(
+                "SELECT COUNT(*) AS count FROM standard_changes WHERE to_standard_id = ? OR from_standard_id = ?",
+                (standard_id, standard_id),
+            ).fetchone()["count"]
+            rule_changes = db.execute(
+                "SELECT COUNT(*) AS count FROM rule_changes WHERE to_standard_id = ? OR from_standard_id = ?",
+                (standard_id, standard_id),
+            ).fetchone()["count"]
+            db.execute(
+                "DELETE FROM standard_changes WHERE to_standard_id = ? OR from_standard_id = ?",
+                (standard_id, standard_id),
+            )
+            db.execute(
+                "DELETE FROM rule_changes WHERE to_standard_id = ? OR from_standard_id = ?",
+                (standard_id, standard_id),
+            )
+            db.execute("DELETE FROM standard_version_sources WHERE standard_id = ?", (standard_id,))
+            db.execute("DELETE FROM standards WHERE id = ?", (standard_id,))
+
+            removed_documents = 0
+            for document_id in document_ids:
+                referenced = db.execute(
+                    "SELECT 1 FROM standard_version_sources WHERE document_id = ? LIMIT 1",
+                    (document_id,),
+                ).fetchone()
+                if not referenced:
+                    cursor = db.execute("DELETE FROM source_documents WHERE id = ?", (document_id,))
+                    removed_documents += cursor.rowcount
+
+            family_remaining = db.execute(
+                "SELECT 1 FROM standards WHERE family_id = ? LIMIT 1", (row["family_id"],)
+            ).fetchone()
+            family_removed = 0
+            if not family_remaining:
+                family_removed = db.execute(
+                    "DELETE FROM standard_families WHERE id = ?", (row["family_id"],)
+                ).rowcount
+
+        return {
+            "id": standard_id,
+            "name": row["name"],
+            "version": row["version"],
+            "deleted_changes": changes,
+            "deleted_rule_changes": rule_changes,
+            "deleted_source_documents": removed_documents,
+            "deleted_family": bool(family_removed),
+        }
+
     def _standard_row(self, row: sqlite3.Row, include_source: bool) -> Dict[str, Any]:
-        compiled = _loads(row["compiled_json"], {})
+        compiled_model = parse_compiled_standard(_loads(row["compiled_json"], {}))
+        compiled = compiled_model.model_dump(mode="json")
+        with self.connect() as db:
+            source_rows = db.execute(
+                """SELECT d.id, d.filename, d.media_type, d.sha256, d.metadata_json, d.created_at, vs.role
+                   FROM standard_version_sources vs
+                   JOIN source_documents d ON d.id = vs.document_id
+                   WHERE vs.standard_id = ? ORDER BY vs.ordinal""",
+                (row["id"],),
+            ).fetchall()
         result = {
             "id": row["id"],
             "name": row["name"],
             "version": row["version"],
             "status": row["status"],
             "parent_id": row["parent_id"],
+            "family_id": row["family_id"],
             "change_summary": row["change_summary"],
             "created_at": row["created_at"],
             "compiled": compiled,
+            "sources": [
+                {
+                    **{key: value for key, value in dict(source).items() if key != "metadata_json"},
+                    "metadata": _loads(source["metadata_json"], {}),
+                }
+                for source in source_rows
+            ],
             "counts": {
-                "labels": len(compiled.get("labels", {}).get("labels", [])),
+                "labels": len(leaf_ids(compiled_model)),
+                "nodes": len(compiled_model.labels.labels),
                 "definitions": len(compiled.get("definition_rules", [])),
                 "boundaries": len(compiled.get("decision_rules", {}).get("boundary_rules", [])),
                 "priorities": len(compiled.get("decision_rules", {}).get("priority_rules", [])),
@@ -253,6 +486,73 @@ class Store:
         if include_source:
             result["source_markdown"] = row["source_markdown"]
         return result
+
+    def create_source_document(
+        self,
+        filename: str,
+        media_type: str,
+        raw_content: bytes,
+        extracted_text: str,
+        metadata: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        digest = hashlib.sha256(raw_content).hexdigest()
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM source_documents WHERE sha256 = ?", (digest,)
+            ).fetchone()
+            if not row:
+                document_id = str(uuid.uuid4())
+                db.execute(
+                    """INSERT INTO source_documents
+                       (id, filename, media_type, sha256, raw_content, extracted_text,
+                        metadata_json, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        document_id,
+                        filename,
+                        media_type,
+                        digest,
+                        raw_content,
+                        extracted_text,
+                        _json(metadata),
+                        utc_now(),
+                    ),
+                )
+                row = db.execute(
+                    "SELECT * FROM source_documents WHERE id = ?", (document_id,)
+                ).fetchone()
+        result = {key: value for key, value in dict(row).items() if key != "raw_content"}
+        result["metadata"] = _loads(result.pop("metadata_json"), {})
+        return result
+
+    def get_source_document(self, document_id: str, include_content: bool = False) -> Dict[str, Any]:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM source_documents WHERE id = ?", (document_id,)
+            ).fetchone()
+        if not row:
+            raise KeyError(f"Source document {document_id} 不存在")
+        result = dict(row)
+        if not include_content:
+            result.pop("raw_content", None)
+        result["metadata"] = _loads(result.pop("metadata_json"), {})
+        return result
+
+    def list_standard_changes(self, standard_id: str) -> List[Dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM standard_changes WHERE to_standard_id = ? ORDER BY created_at, id",
+                (standard_id,),
+            ).fetchall()
+        values: List[Dict[str, Any]] = []
+        for row in rows:
+            value = dict(row)
+            before_json = value.pop("before_json")
+            after_json = value.pop("after_json")
+            value["before"] = _loads(before_json) if before_json else None
+            value["after"] = _loads(after_json) if after_json else None
+            values.append(value)
+        return values
 
     def create_dataset(
         self, name: str, filename: Optional[str], items: Iterable[Dict[str, Any]]
@@ -589,11 +889,22 @@ class Store:
 
     def rule_stats(self, standard_id: str) -> List[Dict[str, Any]]:
         standard = self.get_standard(standard_id)["compiled"]
+        compiled_model = parse_compiled_standard(standard)
+        paths = {
+            label.label_id: label_path(compiled_model, label.label_id)
+            for label in compiled_model.labels.labels
+        }
         descriptors: Dict[str, Dict[str, Any]] = {}
         for rule in standard["definition_rules"]:
-            descriptors[rule["rule_id"]] = {"type": "definition", "labels": [rule["label"]]}
+            descriptors[rule["rule_id"]] = {
+                "type": "definition",
+                "labels": [paths.get(rule["label_id"], rule["label_id"])],
+            }
         for rule in standard["decision_rules"]["boundary_rules"]:
-            descriptors[rule["rule_id"]] = {"type": "boundary", "labels": rule["labels"]}
+            descriptors[rule["rule_id"]] = {
+                "type": "boundary",
+                "labels": [paths.get(label_id, label_id) for label_id in rule["label_ids"]],
+            }
         for rule in standard["decision_rules"]["priority_rules"]:
             descriptors[rule["rule_id"]] = {"type": "priority", "labels": []}
         stats = {

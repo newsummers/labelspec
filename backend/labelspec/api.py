@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -15,13 +16,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .config import get_settings
-from .domain import CompiledStandard, ModelSettings
+from .documents import DOCUMENT_ROLES, MAX_STANDARD_FILES, parse_standard_document
+from .domain import ModelSettings
 from .miner import SpecGapMiner
 from .provider import MissingApiKeyError, ProviderError, QianfanProvider
 from .service import LabelSpecService
-from .store import Store
+from .store import StandardDeleteError, Store
 from .validator import validate_standard
 from .yaml_io import standard_to_yaml_files
+from .taxonomy import parse_compiled_standard
 
 app_settings = get_settings()
 logging.basicConfig(level=app_settings.labelspec_log_level)
@@ -39,7 +42,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="LabelSpec API",
-    version="0.1.0",
+    version="0.2.0",
     description="Compile business standards into executable labeling rules.",
     lifespan=lifespan,
 )
@@ -75,6 +78,12 @@ class RuleRevisionRequest(BaseModel):
     suggestion_id: Optional[str] = None
 
 
+class ManualVersionRequest(BaseModel):
+    compiled: Dict[str, Any]
+    reason: str = Field(min_length=1, max_length=500)
+    resolve_conflicts: bool = False
+
+
 class ImpactRunRequest(BaseModel):
     source_run_id: str
     target_standard_id: str
@@ -87,6 +96,8 @@ def _handle_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=412, detail=str(exc))
     if isinstance(exc, ProviderError):
         return HTTPException(status_code=502, detail=str(exc))
+    if isinstance(exc, StandardDeleteError):
+        return HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, KeyError):
         return HTTPException(status_code=404, detail=str(exc).strip("'"))
     if isinstance(exc, ValueError):
@@ -94,11 +105,43 @@ def _handle_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=500, detail=str(exc))
 
 
+def _conflict_source_excerpts(conflict: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Return only the matching rule blocks, never the complete source document."""
+    names = [part.rsplit("/", 1)[-1].strip() for part in conflict.get("entity_key", "").split(" | ")]
+    excerpts: List[Dict[str, str]] = []
+    seen = set()
+    for ref in conflict.get("source_refs", []):
+        document_id = ref.get("document_id")
+        if not document_id or document_id in seen:
+            continue
+        seen.add(document_id)
+        try:
+            source = store.get_source_document(document_id)
+        except KeyError:
+            continue
+        text = source.get("extracted_text", "")
+        lines = text.splitlines()
+        starts = [index for index, line in enumerate(lines) if re.match(r"^#{3,6}\s+", line)]
+        starts.append(len(lines))
+        for start, end in zip(starts, starts[1:]):
+            block = "\n".join(lines[start:end]).strip()
+            if not block:
+                continue
+            matched = sum(1 for name in names if name and name in block)
+            if matched >= min(2, len(names)):
+                excerpts.append({
+                    "filename": source["filename"],
+                    "locator": ref.get("locator", ""),
+                    "excerpt": block[:6000],
+                })
+    return excerpts
+
+
 @app.get("/api/health")
 def health() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "provider": "qianfan",
         "api_key_configured": provider.configured,
         "database": str(app_settings.database_path),
@@ -126,12 +169,18 @@ async def models() -> Dict[str, Any]:
 @app.get("/api/demo")
 def demo_content() -> Dict[str, str]:
     demo_dir = Path(__file__).parent / "demo"
-    template = Path(__file__).parent / "templates" / "standard-template.md"
+    template = Path(__file__).parent / "templates" / "standard-template.txt"
     return {
         "standard_markdown": (demo_dir / "standard.md").read_text(encoding="utf-8"),
         "dataset_csv": (demo_dir / "data.csv").read_text(encoding="utf-8"),
         "standard_template": template.read_text(encoding="utf-8"),
     }
+
+
+@app.get("/api/standards/template")
+def standard_template() -> Response:
+    template = Path(__file__).parent / "templates" / "standard-template.txt"
+    return Response(content=template.read_text(encoding="utf-8"), media_type="text/plain; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="standard-template.txt"'})
 
 
 @app.post("/api/demo/dataset")
@@ -150,6 +199,35 @@ async def compile_endpoint(payload: CompileRequest) -> Dict[str, Any]:
         raise _handle_error(exc) from exc
 
 
+@app.post("/api/standards/compile-files")
+async def compile_files_endpoint(
+    name: str = Form(..., min_length=1, max_length=100),
+    files: List[UploadFile] = File(...),
+    base_standard_id: Optional[str] = Form(None),
+    roles: List[str] = Form(default=[]),
+) -> Dict[str, Any]:
+    try:
+        if not files or len(files) > MAX_STANDARD_FILES:
+            raise ValueError(f"每次需要上传 1 到 {MAX_STANDARD_FILES} 份标准文档")
+        if roles and len(roles) != len(files):
+            raise ValueError("文档角色数量必须与上传文件数量一致")
+        if any(role not in DOCUMENT_ROLES for role in roles):
+            raise ValueError("文档角色只能是 auto、definition、boundary 或 priority")
+        documents = []
+        for index, upload in enumerate(files):
+            documents.append(
+                parse_standard_document(
+                    upload.filename or "standard.txt",
+                    upload.content_type or "application/octet-stream",
+                    await upload.read(),
+                    roles[index] if roles else "auto",
+                )
+            )
+        return await service.compile_documents(name, documents, base_standard_id)
+    except Exception as exc:
+        raise _handle_error(exc) from exc
+
+
 @app.get("/api/standards")
 def standards() -> List[Dict[str, Any]]:
     return store.list_standards()
@@ -159,13 +237,25 @@ def standards() -> List[Dict[str, Any]]:
 def standard_detail(standard_id: str) -> Dict[str, Any]:
     try:
         standard = store.get_standard(standard_id)
-        compiled = CompiledStandard.model_validate(standard["compiled"])
+        for conflict in standard.get("compiled", {}).get("conflicts", []):
+            if conflict.get("kind") == "boundary" and not conflict.get("source_excerpts"):
+                conflict["source_excerpts"] = _conflict_source_excerpts(conflict)
+        compiled = parse_compiled_standard(standard["compiled"])
         return {
             **standard,
             "validation": validate_standard(compiled).model_dump(),
             "files": standard_to_yaml_files(compiled),
             "rule_stats": store.rule_stats(standard_id),
+            "changes": store.list_standard_changes(standard_id),
         }
+    except Exception as exc:
+        raise _handle_error(exc) from exc
+
+
+@app.delete("/api/standards/{standard_id}")
+def delete_standard(standard_id: str) -> Dict[str, Any]:
+    try:
+        return store.delete_standard(standard_id)
     except Exception as exc:
         raise _handle_error(exc) from exc
 
@@ -174,7 +264,7 @@ def standard_detail(standard_id: str) -> Dict[str, Any]:
 def activate_standard(standard_id: str) -> Dict[str, Any]:
     try:
         standard = store.get_standard(standard_id)
-        report = validate_standard(CompiledStandard.model_validate(standard["compiled"]))
+        report = validate_standard(parse_compiled_standard(standard["compiled"]))
         if not report.valid:
             raise ValueError("Standard 校验未通过，不能激活")
         return store.activate_standard(standard_id)
@@ -195,6 +285,21 @@ def revise_standard(standard_id: str, payload: RuleRevisionRequest) -> Dict[str,
         if payload.suggestion_id:
             store.update_suggestion_status(payload.suggestion_id, "accepted")
         return result
+    except Exception as exc:
+        raise _handle_error(exc) from exc
+
+
+@app.post("/api/standards/{standard_id}/versions")
+def create_manual_standard_version(
+    standard_id: str, payload: ManualVersionRequest
+) -> Dict[str, Any]:
+    try:
+        return service.create_manual_version(
+            standard_id,
+            payload.compiled,
+            payload.reason,
+            payload.resolve_conflicts,
+        )
     except Exception as exc:
         raise _handle_error(exc) from exc
 

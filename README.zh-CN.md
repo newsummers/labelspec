@@ -12,9 +12,13 @@ Standard -> Data -> Model -> Failure -> Standard
 
 ## 功能
 
-- 将自由编写或基于模板的 `standard.md` 编译为三个 YAML 文件
-- 校验 Rule ID 唯一性、Label 引用和 Rule 内容完整性
-- 通过标签地图、Definition、Boundary、Priority、历史 Case 渐进式披露规则
+- 同时上传 MD、TXT、DOCX、文本型 PDF、CSV、XLSX 标准文档
+- 分文档抽取并合并 Definition、Boundary、Priority，保留来源引用并识别冲突
+- 支持任意深度标签树，最终结果只允许没有子节点的叶子标签
+- 每个节点维护局部 Definition，分类时自动继承完整祖先定义链
+- 通过标签树逐层召回候选，再披露相关 Boundary、Priority 和历史 Case
+- 手动新增、修改、删除或移动标签及规则，每次保存创建不可变版本和字段级变更记录
+- 校验树结构、Rule ID 唯一性、Label 引用、规则作用域和来源冲突
 - 独立运行 Annotator 与 Verifier，再以确定性逻辑完成结果分流
 - 输出 `AUTO_ACCEPT`、`REVIEW`、`AMBIGUOUS`、`SPEC_GAP`
 - 聚类重复失败并生成需要人工审核的 Rule 修改建议
@@ -75,7 +79,7 @@ make test
 ```bash
 labelspec --help
 labelspec settings
-labelspec compile standard.md --name "客户意图" --output ./compiled
+labelspec compile standard.md supplemental-boundaries.docx --name "客户意图" --output-dir ./compiled
 labelspec activate <standard-id>
 labelspec import-data cases.csv
 labelspec annotate <dataset-id> <standard-id>
@@ -93,7 +97,7 @@ Web 工作台内置金融/汽车演示标准和 CSV 数据。导入演示数据�
 
 ## 范围
 
-v0.1 只支持单标签文本分类，不负责模型训练或 Fine-tuning。
+v0.2 只支持单标签文本分类；叶子标签可处于任意层级。扫描 PDF 暂不支持 OCR，系统不负责模型训练或 Fine-tuning。
 
 ## License
 

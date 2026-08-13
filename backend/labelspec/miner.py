@@ -8,6 +8,7 @@ from .disclosure import DisclosureEngine
 from .domain import MinerSuggestion
 from .provider import QianfanProvider
 from .store import Store
+from .taxonomy import descendants, label_path, parse_compiled_standard
 
 
 MINER_SYSTEM = """你是 LabelSpec Spec Gap Miner。你会看到一组真实失败 Case 和当前相关 Rule。
@@ -116,14 +117,25 @@ class SpecGapMiner:
     ) -> List[Dict[str, Any]]:
         label_set = set(labels)
         rule_set = set(rule_ids)
+        compiled = parse_compiled_standard(standard)
+        paths = {
+            label.label_id: label_path(compiled, label.label_id)
+            for label in compiled.labels.labels
+        }
         definitions = [
             rule for rule in standard["definition_rules"]
-            if rule["label"] in label_set or rule["rule_id"] in rule_set
+            if paths.get(rule["label_id"]) in label_set or rule["rule_id"] in rule_set
         ]
         boundaries = [
             rule for rule in standard["decision_rules"]["boundary_rules"]
-            if len(label_set.intersection(rule["labels"])) >= 2 or rule["rule_id"] in rule_set
+            if len([
+                item for item in rule["label_ids"]
+                if label_set.intersection(
+                    paths.get(descendant, "")
+                    for descendant in descendants(compiled, item, leaves_only=True)
+                )
+            ]) >= 2
+            or rule["rule_id"] in rule_set
         ]
         priorities = standard["decision_rules"]["priority_rules"]
         return [*definitions, *boundaries, *priorities]
-

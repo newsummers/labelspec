@@ -5,12 +5,14 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from .annotator import annotate
-from .compiler import compile_standard
+from .compiler import CompilerSource, compile_sources
 from .disclosure import DisclosureEngine
 from .domain import AnnotationResult, CompiledStandard
+from .documents import ParsedDocument, parse_standard_document
 from .provider import QianfanProvider
 from .router import route_annotation
 from .store import Store, utc_now
+from .taxonomy import descendants, label_path, parse_compiled_standard, upgrade_compiled_payload
 from .validator import validate_standard
 from .verifier import verify
 from .yaml_io import standard_to_yaml_files
@@ -25,21 +27,101 @@ class LabelSpecService:
         self.disclosure = DisclosureEngine(provider, store)
 
     async def compile(self, name: str, source_markdown: str) -> Dict[str, Any]:
+        document = parse_standard_document(
+            "standard.md", "text/markdown", source_markdown.encode("utf-8")
+        )
+        return await self.compile_documents(name, [document])
+
+    async def compile_documents(
+        self,
+        name: str,
+        documents: List[ParsedDocument],
+        base_standard_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         settings = self.store.get_settings()
-        standard = await compile_standard(
-            self.provider, settings.compiler_model, name, source_markdown
+        base_row = self.store.get_standard(base_standard_id) if base_standard_id else None
+        base = parse_compiled_standard(base_row["compiled"]) if base_row else None
+        if base_row and base_row["name"] != name:
+            raise ValueError("补充文档时标准名称必须与原版本一致")
+
+        stored_documents = [
+            self.store.create_source_document(
+                document.filename,
+                document.media_type,
+                document.raw_content,
+                document.extracted_text,
+                document.metadata,
+            )
+            for document in documents
+        ]
+        role_by_document_id = {
+            stored["id"]: source.role for stored, source in zip(stored_documents, documents)
+        }
+        sources = [
+            CompilerSource(
+                document_id=document["id"],
+                filename=document["filename"],
+                text=document["extracted_text"],
+                role=role_by_document_id[document["id"]],
+            )
+            for document in stored_documents
+        ]
+        standard = await compile_sources(
+            self.provider, settings.compiler_model, name, sources, base=base
         )
         report = validate_standard(standard)
-        saved = self.store.create_standard(source_markdown, standard, status="draft")
+        previous_source_ids = [source["id"] for source in base_row.get("sources", [])] if base_row else []
+        source_ids = list(dict.fromkeys([*previous_source_ids, *[item["id"] for item in stored_documents]]))
+        previous_roles = {
+            source["id"]: source.get("role", "auto")
+            for source in (base_row or {}).get("sources", [])
+        }
+        source_roles = [role_by_document_id.get(source_id, previous_roles.get(source_id, "auto")) for source_id in source_ids]
+        source_texts = []
+        for source_id in source_ids:
+            source = self.store.get_source_document(source_id)
+            source_texts.append(f"# Source: {source['filename']}\n\n{source['extracted_text']}")
+        changes = self._diff_standard(base, standard) if base else [
+            {
+                "operation": "add",
+                "entity_type": "standard",
+                "entity_id": None,
+                "before": None,
+                "after": standard.model_dump(mode="json"),
+            }
+        ]
+        for document in stored_documents:
+            if document["id"] not in previous_source_ids:
+                changes.append(
+                    {
+                        "operation": "add",
+                        "entity_type": "document",
+                        "entity_id": document["id"],
+                        "before": None,
+                        "after": {"filename": document["filename"], "sha256": document["sha256"]},
+                    }
+                )
+        saved = self.store.create_standard(
+            "\n\n---\n\n".join(source_texts),
+            standard,
+            status="draft",
+            parent_id=base_standard_id,
+            family_id=base_row["family_id"] if base_row else None,
+            source_document_ids=source_ids,
+            source_document_roles=source_roles,
+            changes=changes,
+            change_summary="补充标准文档" if base_row else "从标准文档编译",
+            origin="document_import",
+        )
         return {
             "standard": saved,
-            "validation": report.model_dump(),
+            "validation": report.model_dump(mode="json"),
             "files": standard_to_yaml_files(standard),
         }
 
     async def process_run(self, run_id: str) -> None:
         run = self.store.get_run(run_id)
-        standard = CompiledStandard.model_validate(
+        standard = parse_compiled_standard(
             self.store.get_standard(run["standard_id"])["compiled"]
         )
         report = validate_standard(standard)
@@ -131,6 +213,100 @@ class LabelSpecService:
             logger.exception("Annotation run %s failed", run_id)
             self.store.update_run(run_id, status="failed", error=str(exc), completed_at=utc_now())
 
+    @staticmethod
+    def _entity_maps(standard: CompiledStandard) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        return {
+            "label": {item.label_id: item.model_dump(mode="json") for item in standard.labels.labels},
+            "definition": {item.rule_id: item.model_dump(mode="json") for item in standard.definition_rules},
+            "boundary": {
+                item.rule_id: item.model_dump(mode="json")
+                for item in standard.decision_rules.boundary_rules
+            },
+            "priority": {
+                item.rule_id: item.model_dump(mode="json")
+                for item in standard.decision_rules.priority_rules
+            },
+        }
+
+    @classmethod
+    def _diff_standard(
+        cls, before: Optional[CompiledStandard], after: CompiledStandard
+    ) -> List[Dict[str, Any]]:
+        if not before:
+            return []
+        changes: List[Dict[str, Any]] = []
+        before_maps = cls._entity_maps(before)
+        after_maps = cls._entity_maps(after)
+        for entity_type in ("label", "definition", "boundary", "priority"):
+            old = before_maps[entity_type]
+            new = after_maps[entity_type]
+            for entity_id in sorted(old.keys() - new.keys()):
+                changes.append({
+                    "operation": "delete", "entity_type": entity_type,
+                    "entity_id": entity_id, "before": old[entity_id], "after": None,
+                })
+            for entity_id in sorted(new.keys() - old.keys()):
+                changes.append({
+                    "operation": "add", "entity_type": entity_type,
+                    "entity_id": entity_id, "before": None, "after": new[entity_id],
+                })
+            for entity_id in sorted(old.keys() & new.keys()):
+                if old[entity_id] == new[entity_id]:
+                    continue
+                operation = "update"
+                if entity_type == "label" and old[entity_id].get("parent_id") != new[entity_id].get("parent_id"):
+                    operation = "move"
+                changes.append({
+                    "operation": operation, "entity_type": entity_type,
+                    "entity_id": entity_id, "before": old[entity_id], "after": new[entity_id],
+                })
+        return changes
+
+    def create_manual_version(
+        self,
+        standard_id: str,
+        compiled: Dict[str, Any],
+        reason: str,
+        resolve_conflicts: bool = False,
+    ) -> Dict[str, Any]:
+        current = self.store.get_standard(standard_id)
+        before = parse_compiled_standard(current["compiled"])
+        payload = upgrade_compiled_payload(copy.deepcopy(compiled))
+        payload["name"] = current["name"]
+        payload["schema_version"] = "0.2"
+        payload["conflicts"] = (
+            []
+            if resolve_conflicts
+            else [conflict.model_dump(mode="json") for conflict in before.conflicts]
+        )
+        revised = CompiledStandard.model_validate(payload)
+        report = validate_standard(revised)
+        changes = self._diff_standard(before, revised)
+        if resolve_conflicts and before.conflicts:
+            changes.append(
+                {
+                    "operation": "update",
+                    "entity_type": "conflicts",
+                    "entity_id": None,
+                    "before": [item.model_dump(mode="json") for item in before.conflicts],
+                    "after": [],
+                }
+            )
+        if not changes:
+            raise ValueError("标准内容没有变化")
+        saved = self.store.create_standard(
+            current["source_markdown"], revised, status="draft", parent_id=standard_id,
+            family_id=current["family_id"],
+            source_document_ids=[source["id"] for source in current.get("sources", [])],
+            source_document_roles=[source.get("role", "auto") for source in current.get("sources", [])],
+            changes=changes, change_summary=reason.strip() or "手动编辑标准", origin="manual",
+        )
+        return {
+            "standard": saved,
+            "validation": report.model_dump(mode="json"),
+            "files": standard_to_yaml_files(revised),
+        }
+
     def revise_rule(
         self,
         standard_id: str,
@@ -147,41 +323,33 @@ class LabelSpecService:
         before = copy.deepcopy(target)
         target.clear()
         target.update(new_rule)
-        revised = CompiledStandard.model_validate(compiled)
-        report = validate_standard(revised)
-        if not report.valid:
-            raise ValueError("Rule 修改导致 Standard 校验失败: " + "; ".join(i.message for i in report.issues))
-        source = current["source_markdown"] + (
-            f"\n\n<!-- LabelSpec revision: {rule_id} -->\n"
-            f"## Rule revision {rule_id}\n\nReason: {reason}\n"
-        )
-        saved = self.store.create_standard(
-            source_markdown=source,
-            standard=revised,
-            status="draft",
-            parent_id=standard_id,
-            change_summary=f"{rule_id}: {reason}",
-        )
-        activated = self.store.activate_standard(saved["id"])
+        result = self.create_manual_version(standard_id, compiled, reason)
+        saved = result["standard"]
         self.store.record_rule_change(
             standard_id,
-            activated["id"],
+            saved["id"],
             rule_id,
             before,
             new_rule,
             reason,
             related_case_ids,
         )
-        return {"standard": activated, "affected_labels": labels, "validation": report.model_dump()}
+        return {"standard": saved, "affected_labels": labels, "validation": result["validation"]}
 
     @staticmethod
     def _find_rule(compiled: Dict[str, Any], rule_id: str) -> Tuple[Dict[str, Any], List[str]]:
         for rule in compiled["definition_rules"]:
             if rule["rule_id"] == rule_id:
-                return rule, [rule["label"]]
+                standard = parse_compiled_standard(compiled)
+                affected = descendants(standard, rule["label_id"], leaves_only=True)
+                return rule, [label_path(standard, label_id) for label_id in sorted(affected)]
         for rule in compiled["decision_rules"]["boundary_rules"]:
             if rule["rule_id"] == rule_id:
-                return rule, list(rule["labels"])
+                standard = parse_compiled_standard(compiled)
+                affected = set()
+                for label_id in rule["label_ids"]:
+                    affected.update(descendants(standard, label_id, leaves_only=True))
+                return rule, [label_path(standard, label_id) for label_id in sorted(affected)]
         for rule in compiled["decision_rules"]["priority_rules"]:
             if rule["rule_id"] == rule_id:
                 return rule, []

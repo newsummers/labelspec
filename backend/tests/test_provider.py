@@ -1,4 +1,5 @@
 import pytest
+import httpx
 
 from labelspec.config import AppSettings
 from labelspec.provider import MissingApiKeyError, QianfanProvider
@@ -17,6 +18,36 @@ def test_json_fence_is_parsed() -> None:
 
 def test_json_with_trailing_text_is_parsed() -> None:
     assert QianfanProvider._extract_json('{"label": "x"}\n完成') == {"label": "x"}
+
+
+@pytest.mark.asyncio
+async def test_chat_does_not_apply_client_timeout(monkeypatch) -> None:
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "{}"}}]}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    provider = QianfanProvider(AppSettings(qianfan_api_key="test"))
+    assert await provider._chat({"model": "test"}) == "{}"
+    assert captured["timeout"] is None
 
 
 @pytest.mark.asyncio

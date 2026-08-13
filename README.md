@@ -12,9 +12,13 @@ Standard -> Data -> Model -> Failure -> Standard
 
 ## Features
 
-- Compile free-form or template-based `standard.md` into `labels.yaml`, `definition_rules.yaml`, and `decision_rules.yaml`
-- Validate unique Rule IDs, label references, and required Rule content
-- Annotate with progressive disclosure: full label map, candidate definitions, boundary rules, priority rules, then historical cases
+- Upload MD, TXT, DOCX, text-based PDF, CSV, and XLSX standard documents together
+- Merge per-document extraction with source references and explicit conflict detection
+- Model arbitrary-depth label trees and classify only nodes without children
+- Inherit the full ancestor Definition chain while keeping each node's definition local
+- Recall candidates level by level before disclosing relevant Boundary, Priority, and historical cases
+- Create immutable, field-diffed versions for every explicit manual edit
+- Validate tree structure, Rule IDs, references, scopes, and unresolved source conflicts
 - Independently run an Annotator and Verifier before deterministic routing
 - Route every result to `AUTO_ACCEPT`, `REVIEW`, `AMBIGUOUS`, or `SPEC_GAP`
 - Cluster repeated failures and generate reviewable Rule change suggestions
@@ -83,7 +87,7 @@ make test
 ```bash
 labelspec --help
 labelspec settings
-labelspec compile standard.md --name "Support Intent" --output ./compiled
+labelspec compile standard.md supplemental-boundaries.docx --name "Support Intent" --output-dir ./compiled
 labelspec validate \
   --labels-yaml compiled/labels.yaml \
   --definitions-yaml compiled/definition_rules.yaml \
@@ -127,7 +131,7 @@ Texts and standards sent to configured models are processed by Qianfan under you
 
 ## Scope
 
-Version 0.1 supports single-label text classification only. Model training and fine-tuning are out of scope.
+Version 0.2 supports single-label text classification with leaves at arbitrary depths. Scanned PDF OCR, model training, and fine-tuning are out of scope.
 
 ## Contributing
 

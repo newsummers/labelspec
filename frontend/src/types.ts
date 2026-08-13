@@ -1,36 +1,52 @@
 export type Route = 'AUTO_ACCEPT' | 'REVIEW' | 'AMBIGUOUS' | 'SPEC_GAP'
 
-export interface LabelItem { name: string; description: string }
+export interface SourceReference { document_id: string; filename: string; locator: string }
+export interface LabelItem {
+  label_id: string
+  name: string
+  description: string
+  parent_id?: string | null
+  source_refs: SourceReference[]
+}
 export interface DefinitionRule {
   rule_id: string
-  label: string
+  label_id: string
   definition: string
   include: string[]
   exclude: string[]
-  positive_examples: string[]
-  negative_examples: string[]
+  source_refs: SourceReference[]
 }
-export interface BoundaryRule { rule_id: string; labels: string[]; condition: string; decision: string }
-export interface PriorityRule { rule_id: string; principle: string }
+export interface BoundaryRule { rule_id: string; label_ids: string[]; scope_label_id?: string | null; condition: string; decision: string; source_refs: SourceReference[] }
+export interface PriorityRule { rule_id: string; principle: string; scope_label_id?: string | null; source_refs: SourceReference[] }
+export interface ConflictCandidate { rule_id?: string; label_ids: string[]; scope_label_id?: string | null; condition: string; decision: string; source_refs: SourceReference[] }
+export interface CompilationConflict { conflict_id: string; kind: string; entity_key: string; message: string; source_refs: SourceReference[]; candidates?: ConflictCandidate[]; source_excerpts?: Array<{ filename: string; locator: string; excerpt: string }>; resolved: boolean }
 export interface CompiledStandard {
+  schema_version: '0.2'
   name: string
   labels: { labels: LabelItem[] }
   definition_rules: DefinitionRule[]
   decision_rules: { boundary_rules: BoundaryRule[]; priority_rules: PriorityRule[] }
+  conflicts: CompilationConflict[]
 }
+export type DocumentRole = 'auto' | 'definition' | 'boundary' | 'priority'
+export interface StandardSource { id: string; filename: string; media_type: string; sha256: string; metadata: Record<string, unknown>; created_at: string; role?: DocumentRole }
+export interface StandardChange { id: string; operation: 'add' | 'update' | 'delete' | 'move'; entity_type: string; entity_id?: string; before?: unknown; after?: unknown; reason?: string; origin: string; created_at: string }
 export interface StandardSummary {
   id: string
   name: string
   version: number
   status: 'draft' | 'active' | 'archived'
   parent_id?: string
+  family_id: string
   created_at: string
   change_summary?: string
-  counts: { labels: number; definitions: number; boundaries: number; priorities: number }
+  counts: { labels: number; nodes?: number; definitions: number; boundaries: number; priorities: number }
   compiled: CompiledStandard
   source_markdown?: string
-  validation?: { valid: boolean; issues: Array<{ code: string; message: string }> }
+  validation?: { valid: boolean; issues: Array<{ code: string; message: string; path?: string; severity?: string }> }
   files?: Record<string, string>
+  sources?: StandardSource[]
+  changes?: StandardChange[]
   rule_stats?: Array<{ rule_id: string; type: string; labels: string[]; uses: number; conflicts: number; overrides: number; modifications: number }>
 }
 export interface Dataset {

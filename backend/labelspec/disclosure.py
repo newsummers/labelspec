@@ -3,20 +3,23 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Sequence
 
-from .domain import (
-    CandidateDecision,
-    CompiledStandard,
-    DisclosureTrace,
-)
+from .domain import CandidateDecision, CompiledStandard, DisclosureTrace
 from .provider import QianfanProvider
 from .store import Store
+from .taxonomy import (
+    children_index,
+    descendants,
+    effective_definitions,
+    label_index,
+    label_path,
+    leaf_ids,
+    path_index,
+)
 
 
-CANDIDATE_SYSTEM = """你是单标签文本分类的候选召回器。你会看到完整标签空间和全部全局 Priority Rule。
-此阶段不做最终分类，只选出所有合理候选标签（通常 1-3 个，最多 5 个）。
-不得返回标签目录之外的标签。存在跨行业实体时，不要只按实体行业召回，要考虑用户最终诉求。
-candidates 数组中的每一项只能逐字复制标签目录中的完整标签名，不得添加冒号、解释、子类或任何其他文字；解释只能放在 rationale。
-输出严格遵循 JSON Schema。"""
+CANDIDATE_SYSTEM = """你是分层单标签分类的候选召回器。你会看到当前层级可选节点及其局部定义。
+选择 1 到 5 个最可能的候选路径，不做最终裁决；有歧义时保留多个分支，不得返回目录之外的路径。
+返回简短召回理由。"""
 
 
 class DisclosureEngine:
@@ -31,59 +34,114 @@ class DisclosureEngine:
         standard: CompiledStandard,
         model: str,
         embedding_model: str,
-        include_history: bool = False,
+        top_k_history: int = 3,
     ) -> DisclosureTrace:
-        labels = standard.labels.labels
-        priorities = standard.decision_rules.priority_rules
-        label_map = "\n".join(f"- {label.name}: {label.description}" for label in labels)
-        priority_map = "\n".join(f"- {rule.rule_id}: {rule.principle}" for rule in priorities) or "（无）"
-        candidate_prompt = f"待分类文本：{text}\n\n完整标签目录：\n{label_map}\n\n全局 Priority Rules：\n{priority_map}"
-        candidate = await self.provider.structured(
-            model=model,
-            system=CANDIDATE_SYSTEM,
-            user=candidate_prompt,
-            response_model=CandidateDecision,
-            temperature=0.05,
+        candidate_paths, _ = await self._recall_candidates(
+            text, standard, model
         )
-        known = {label.name for label in labels}
-        candidates = self._normalize_candidates(candidate.candidates, known)
-        if not candidates:
-            candidate = await self.provider.structured(
-                model=model,
-                system=CANDIDATE_SYSTEM,
-                user=(
-                    candidate_prompt
-                    + "\n\n上一次返回的候选均不在标签目录中。重新选择，candidates 每项只能从以下字符串中原样取值：\n"
-                    + str(sorted(known))
-                ),
-                response_model=CandidateDecision,
-                temperature=0,
-            )
-            candidates = self._normalize_candidates(candidate.candidates, known)
-        if not candidates:
-            raise ValueError("候选模型未返回任何合法标签")
-
-        definitions = [rule for rule in standard.definition_rules if rule.label in candidates]
-        candidate_set = set(candidates)
+        paths = path_index(standard)
+        candidate_ids = [paths[path] for path in candidate_paths if path in paths]
+        definitions = effective_definitions(standard, candidate_ids)
         boundaries = [
             rule
             for rule in standard.decision_rules.boundary_rules
-            if len(candidate_set.intersection(rule.labels)) >= 2
+            if self._boundary_relevant(standard, rule.label_ids, candidate_ids, rule.scope_label_id)
         ]
-        history: List[Dict[str, Any]] = []
-        if include_history:
-            history = await self.retrieve_history(text, item_id, embedding_model)
+        priorities = [
+            rule
+            for rule in standard.decision_rules.priority_rules
+            if not rule.scope_label_id
+            or any(
+                candidate in descendants(standard, rule.scope_label_id, leaves_only=True)
+                for candidate in candidate_ids
+            )
+        ]
+        historical_cases = await self._retrieve_history(
+            text, item_id, candidate_paths, embedding_model, top_k_history
+        )
+        by_id = label_index(standard)
         return DisclosureTrace(
-            label_map=labels,
+            label_map=[by_id[rule.label_id] for rule in definitions],
             global_priority_rules=priorities,
-            candidates=candidates,
+            candidates=candidate_paths,
             definitions=definitions,
             boundaries=boundaries,
-            historical_cases=history,
+            historical_cases=historical_cases,
         )
 
+    async def _recall_candidates(
+        self, text: str, standard: CompiledStandard, model: str
+    ) -> tuple[List[str], str]:
+        by_id = label_index(standard)
+        definitions = {rule.label_id: rule for rule in standard.definition_rules}
+        children = children_index(standard)
+        leaves = leaf_ids(standard)
+        selected = [label.label_id for label in children.get(None, [])]
+        rationale_parts: List[str] = []
+        max_rounds = max((len(label_path(standard, label_id).split("/")) for label_id in leaves), default=1)
+
+        for _ in range(max_rounds):
+            options: List[str] = []
+            for label_id in selected:
+                if label_id in leaves:
+                    options.append(label_id)
+                else:
+                    options.extend(child.label_id for child in children.get(label_id, []))
+            options = list(dict.fromkeys(options))
+            if not options:
+                break
+            if len(options) == 1:
+                selected = options
+                continue
+            catalog = [
+                {
+                    "path": label_path(standard, label_id),
+                    "description": by_id[label_id].description,
+                    "definition": definitions[label_id].definition if label_id in definitions else "",
+                }
+                for label_id in options
+            ]
+            relevant_priorities = [
+                rule.model_dump(mode="json")
+                for rule in standard.decision_rules.priority_rules
+                if not rule.scope_label_id
+                or any(
+                    option in descendants(standard, rule.scope_label_id)
+                    for option in options
+                )
+            ]
+            decision = await self.provider.structured(
+                model=model,
+                system=CANDIDATE_SYSTEM,
+                user=f"标签节点：{catalog}\n\n相关 Priority：{relevant_priorities}\n\n待分类文本：{text}",
+                response_model=CandidateDecision,
+                temperature=0.0,
+            )
+            option_paths = {label_path(standard, label_id): label_id for label_id in options}
+            normalized = self._normalize_candidates(decision.candidates, set(option_paths))
+            chosen = [option_paths[path] for path in normalized]
+            selected = list(dict.fromkeys(chosen))[:5] or options[:5]
+            rationale_parts.append(decision.rationale)
+            if all(label_id in leaves for label_id in selected):
+                break
+
+        final_ids: List[str] = []
+        for label_id in selected:
+            if label_id in leaves:
+                final_ids.append(label_id)
+            else:
+                final_ids.extend(sorted(descendants(standard, label_id, leaves_only=True)))
+        final_ids = list(dict.fromkeys(final_ids))[:5]
+        if not final_ids:
+            final_ids = [
+                label.label_id
+                for label in standard.labels.labels
+                if label.label_id in leaves
+            ][:5]
+        return [label_path(standard, label_id) for label_id in final_ids], "；".join(rationale_parts)
+
     @staticmethod
-    def _normalize_candidates(values: Sequence[str], known: set) -> List[str]:
+    def _normalize_candidates(values: Sequence[str], known: set[str]) -> List[str]:
         normalized: List[str] = []
         for value in values:
             candidate = value.strip()
@@ -97,32 +155,58 @@ class DisclosureEngine:
                     break
         return list(dict.fromkeys(normalized))
 
-    async def retrieve_history(
-        self, text: str, item_id: str, embedding_model: str, limit: int = 10
+    @staticmethod
+    def _boundary_relevant(
+        standard: CompiledStandard,
+        referenced_ids: List[str],
+        candidate_ids: List[str],
+        scope_label_id: str | None,
+    ) -> bool:
+        if scope_label_id:
+            scope_leaves = descendants(standard, scope_label_id, leaves_only=True)
+            candidates = [item for item in candidate_ids if item in scope_leaves]
+        else:
+            candidates = candidate_ids
+        matched_groups = 0
+        for referenced in referenced_ids:
+            covered = descendants(standard, referenced, leaves_only=True)
+            if any(candidate in covered for candidate in candidates):
+                matched_groups += 1
+        return matched_groups >= 2
+
+    async def _retrieve_history(
+        self,
+        text: str,
+        item_id: str,
+        candidates: List[str],
+        embedding_model: str,
+        top_k: int,
     ) -> List[Dict[str, Any]]:
-        cases = self.store.historical_cases(exclude_item_id=item_id)
+        cases = [
+            case
+            for case in self.store.historical_cases(exclude_item_id=item_id)
+            if case.get("label") in candidates
+        ]
         if not cases:
             return []
+        query_vector = (await self.provider.embeddings(embedding_model, [text]))[0]
         cached = self.store.get_embeddings([case["id"] for case in cases], embedding_model)
         missing = [case for case in cases if case["id"] not in cached]
         if missing:
             vectors = await self.provider.embeddings(embedding_model, [case["text"] for case in missing])
-            new_values = {case["id"]: vector for case, vector in zip(missing, vectors)}
-            self.store.save_embeddings(new_values, embedding_model)
-            cached.update(new_values)
-        query_vector = (await self.provider.embeddings(embedding_model, [text]))[0]
+            additions = {case["id"]: vector for case, vector in zip(missing, vectors)}
+            self.store.save_embeddings(additions, embedding_model)
+            cached.update(additions)
         ranked = sorted(
             cases,
             key=lambda case: self._cosine(query_vector, cached[case["id"]]),
             reverse=True,
-        )[:limit]
+        )[:top_k]
         return [
             {
-                "item_id": case["id"],
                 "text": case["text"],
                 "label": case["label"],
                 "similarity": round(self._cosine(query_vector, cached[case["id"]]), 4),
-                "note": case.get("review_note"),
             }
             for case in ranked
         ]

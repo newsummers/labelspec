@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class Route(str, Enum):
@@ -19,40 +19,50 @@ class RuleType(str, Enum):
     priority = "priority"
 
 
+class SourceReference(BaseModel):
+    document_id: str
+    filename: str
+    locator: str = ""
+
+
 class LabelDefinition(BaseModel):
+    label_id: str = Field(pattern=r"^L\d{3,}$")
     name: str = Field(min_length=1)
     description: str = Field(min_length=1)
+    parent_id: Optional[str] = None
+    source_refs: List[SourceReference] = Field(default_factory=list)
 
 
 class LabelsDocument(BaseModel):
-    labels: List[LabelDefinition] = Field(min_length=2)
+    labels: List[LabelDefinition] = Field(min_length=1)
 
     @field_validator("labels")
     @classmethod
-    def labels_are_unique(cls, value: List[LabelDefinition]) -> List[LabelDefinition]:
-        names = [item.name for item in value]
-        if len(names) != len(set(names)):
-            raise ValueError("标签名称必须唯一")
+    def label_ids_are_unique(cls, value: List[LabelDefinition]) -> List[LabelDefinition]:
+        label_ids = [item.label_id for item in value]
+        if len(label_ids) != len(set(label_ids)):
+            raise ValueError("标签 ID 必须唯一")
         return value
 
 
 class DefinitionRule(BaseModel):
     rule_id: str = Field(pattern=r"^D\d{3,}$")
-    label: str
+    label_id: str = Field(pattern=r"^L\d{3,}$")
     definition: str = Field(min_length=1)
     include: List[str] = Field(default_factory=list)
     exclude: List[str] = Field(default_factory=list)
-    positive_examples: List[str] = Field(default_factory=list)
-    negative_examples: List[str] = Field(default_factory=list)
+    source_refs: List[SourceReference] = Field(default_factory=list)
 
 
 class BoundaryRule(BaseModel):
     rule_id: str = Field(pattern=r"^B\d{3,}$")
-    labels: List[str] = Field(min_length=2)
+    label_ids: List[str] = Field(min_length=2)
+    scope_label_id: Optional[str] = None
     condition: str = Field(min_length=1)
     decision: str = Field(min_length=1)
+    source_refs: List[SourceReference] = Field(default_factory=list)
 
-    @field_validator("labels")
+    @field_validator("label_ids")
     @classmethod
     def boundary_labels_are_unique(cls, value: List[str]) -> List[str]:
         if len(value) != len(set(value)):
@@ -63,6 +73,17 @@ class BoundaryRule(BaseModel):
 class PriorityRule(BaseModel):
     rule_id: str = Field(pattern=r"^P\d{3,}$")
     principle: str = Field(min_length=1)
+    scope_label_id: Optional[str] = None
+    source_refs: List[SourceReference] = Field(default_factory=list)
+
+
+class ConflictCandidate(BaseModel):
+    rule_id: str = ""
+    label_ids: List[str] = Field(default_factory=list)
+    scope_label_id: Optional[str] = None
+    condition: str = ""
+    decision: str = ""
+    source_refs: List[SourceReference] = Field(default_factory=list)
 
 
 class DecisionRulesDocument(BaseModel):
@@ -70,11 +91,24 @@ class DecisionRulesDocument(BaseModel):
     priority_rules: List[PriorityRule] = Field(default_factory=list)
 
 
+class CompilationConflict(BaseModel):
+    conflict_id: str
+    kind: str
+    entity_key: str
+    message: str
+    source_refs: List[SourceReference] = Field(default_factory=list)
+    candidates: List[ConflictCandidate] = Field(default_factory=list)
+    source_excerpts: List[Dict[str, str]] = Field(default_factory=list)
+    resolved: bool = False
+
+
 class CompiledStandard(BaseModel):
+    schema_version: Literal["0.2"] = "0.2"
     name: str = Field(min_length=1)
     labels: LabelsDocument
     definition_rules: List[DefinitionRule]
     decision_rules: DecisionRulesDocument
+    conflicts: List[CompilationConflict] = Field(default_factory=list)
 
 
 class ValidationIssue(BaseModel):
@@ -171,4 +205,3 @@ class MinerSuggestion(BaseModel):
     problem: str
     target_rule_id: Optional[str] = None
     proposed_change: str
-

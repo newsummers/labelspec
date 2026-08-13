@@ -1,4 +1,4 @@
-import type { Dataset, ModelSettings, Run, RunDetail, StandardSummary, Suggestion } from './types'
+import type { Dataset, DocumentRole, ModelSettings, Run, RunDetail, StandardSummary, Suggestion } from './types'
 
 const base = import.meta.env.VITE_API_BASE_URL || ''
 
@@ -23,10 +23,21 @@ export const api = {
   saveSettings: (models: ModelSettings) => request<{ models: ModelSettings; api_key_configured: boolean }>('/api/settings', { method: 'PUT', body: JSON.stringify(models) }),
   models: () => request<{ data: Array<{ id?: string; model?: string; owned_by?: string }> }>('/api/models'),
   demo: () => request<{ standard_markdown: string; dataset_csv: string; standard_template: string }>('/api/demo'),
+  standardTemplateUrl: '/api/standards/template',
   createDemoDataset: () => request<Dataset>('/api/demo/dataset', { method: 'POST' }),
   standards: () => request<StandardSummary[]>('/api/standards'),
   standard: (id: string) => request<StandardSummary>(`/api/standards/${id}`),
+  deleteStandard: (id: string) => request<{ id: string; name: string; version: number; deleted_source_documents: number; deleted_family: boolean }>(`/api/standards/${id}`, { method: 'DELETE' }),
   compile: (name: string, source_markdown: string) => request<{ standard: StandardSummary; validation: { valid: boolean }; files: Record<string, string> }>('/api/standards/compile', { method: 'POST', body: JSON.stringify({ name, source_markdown }) }),
+  compileFiles: (name: string, files: File[], baseStandardId?: string, roles?: DocumentRole[]) => {
+    const form = new FormData()
+    form.append('name', name)
+    files.forEach(file => form.append('files', file))
+    roles?.forEach(role => form.append('roles', role))
+    if (baseStandardId) form.append('base_standard_id', baseStandardId)
+    return request<{ standard: StandardSummary; validation: { valid: boolean }; files: Record<string, string> }>('/api/standards/compile-files', { method: 'POST', body: form })
+  },
+  saveStandardVersion: (id: string, compiled: import('./types').CompiledStandard, reason: string, resolveConflicts = false) => request<{ standard: StandardSummary; validation: { valid: boolean }; files: Record<string, string> }>(`/api/standards/${id}/versions`, { method: 'POST', body: JSON.stringify({ compiled, reason, resolve_conflicts: resolveConflicts }) }),
   activate: (id: string) => request<StandardSummary>(`/api/standards/${id}/activate`, { method: 'POST' }),
   revise: (id: string, payload: unknown) => request<{ standard: StandardSummary; affected_labels: string[] }>(`/api/standards/${id}/revise`, { method: 'POST', body: JSON.stringify(payload) }),
   datasets: () => request<Dataset[]>('/api/datasets'),
