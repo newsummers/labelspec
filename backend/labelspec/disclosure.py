@@ -3,13 +3,13 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Sequence
 
-from .domain import CandidateDecision, CompiledStandard, DisclosureTrace
+from .domain import CandidateDecision, CompiledStandard, DefinitionChain, DisclosureTrace
 from .provider import QianfanProvider
 from .store import Store
 from .taxonomy import (
+    ancestors,
     children_index,
     descendants,
-    effective_definitions,
     label_index,
     label_path,
     leaf_ids,
@@ -35,13 +35,27 @@ class DisclosureEngine:
         model: str,
         embedding_model: str,
         top_k_history: int = 3,
+        include_history: bool = False,
     ) -> DisclosureTrace:
         candidate_paths, _ = await self._recall_candidates(
             text, standard, model
         )
         paths = path_index(standard)
         candidate_ids = [paths[path] for path in candidate_paths if path in paths]
-        definitions = effective_definitions(standard, candidate_ids)
+        by_definition_label = {rule.label_id: rule for rule in standard.definition_rules}
+        by_id = label_index(standard)
+        chains = [
+            DefinitionChain(
+                leaf_label_id=leaf_id,
+                leaf_path=label_path(standard, leaf_id),
+                chain=[
+                    by_definition_label[step_id]
+                    for step_id in ancestors(standard, leaf_id)
+                    if step_id in by_definition_label
+                ],
+            )
+            for leaf_id in candidate_ids
+        ]
         boundaries = [
             rule
             for rule in standard.decision_rules.boundary_rules
@@ -56,15 +70,23 @@ class DisclosureEngine:
                 for candidate in candidate_ids
             )
         ]
-        historical_cases = await self._retrieve_history(
-            text, item_id, candidate_paths, embedding_model, top_k_history
+        historical_cases = []
+        if include_history:
+            historical_cases = await self.retrieve_history(
+                text, item_id, candidate_paths, embedding_model, top_k_history
+            )
+        referenced_label_ids = list(
+            dict.fromkeys(
+                step_id
+                for leaf_id in candidate_ids
+                for step_id in ancestors(standard, leaf_id)
+            )
         )
-        by_id = label_index(standard)
         return DisclosureTrace(
-            label_map=[by_id[rule.label_id] for rule in definitions],
+            label_map=[by_id[label_id] for label_id in referenced_label_ids],
             global_priority_rules=priorities,
             candidates=candidate_paths,
-            definitions=definitions,
+            definitions=chains,
             boundaries=boundaries,
             historical_cases=historical_cases,
         )
@@ -174,13 +196,13 @@ class DisclosureEngine:
                 matched_groups += 1
         return matched_groups >= 2
 
-    async def _retrieve_history(
+    async def retrieve_history(
         self,
         text: str,
         item_id: str,
         candidates: List[str],
         embedding_model: str,
-        top_k: int,
+        top_k: int = 3,
     ) -> List[Dict[str, Any]]:
         cases = [
             case

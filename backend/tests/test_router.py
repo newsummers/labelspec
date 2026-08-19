@@ -5,7 +5,9 @@ from labelspec.router import route_annotation
 def annotation(**overrides):
     data = {
         "label": "金融/贷款",
-        "rules_used": ["D001", "B001", "P001"],
+        "leaf_rule_used": "D001",
+        "path_rules_referenced": [],
+        "decision_rules_referenced": ["B001", "P001"],
         "rule_reasons": {},
         "evidence": "询问贷款利率",
         "confidence": 0.94,
@@ -59,3 +61,9 @@ def test_omitted_boundary_routes_to_review() -> None:
     assert route == Route.review
     assert "Boundary" in reasons[0]
 
+
+def test_needs_history_routes_to_review() -> None:
+    route, reasons = route_annotation(annotation(needs_history=True), verifier(), 0.85)
+
+    assert route == Route.review
+    assert "历史人工 Case" in reasons[0]

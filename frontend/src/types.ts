@@ -16,6 +16,11 @@ export interface DefinitionRule {
   exclude: string[]
   source_refs: SourceReference[]
 }
+export interface DefinitionChain {
+  leaf_label_id: string
+  leaf_path: string
+  chain: DefinitionRule[]
+}
 export interface BoundaryRule { rule_id: string; label_ids: string[]; scope_label_id?: string | null; condition: string; decision: string; source_refs: SourceReference[] }
 export interface PriorityRule { rule_id: string; principle: string; scope_label_id?: string | null; source_refs: SourceReference[] }
 export interface ConflictCandidate { rule_id?: string; label_ids: string[]; scope_label_id?: string | null; condition: string; decision: string; source_refs: SourceReference[] }
@@ -102,12 +107,12 @@ export interface Annotation {
   route: Route
   route_reasons: string[]
   disclosure: {
-    definitions: DefinitionRule[]
+    definitions: DefinitionChain[]
     boundaries: BoundaryRule[]
     global_priority_rules: PriorityRule[]
     historical_cases: Array<Record<string, unknown>>
   }
-  verifier: { verdict: string; explanation: string; confidence: number }
+  verifier: { verdict: 'PASS' | 'UNCERTAIN' | 'REJECT'; explanation: string; confidence: number }
 }
 export interface RunDetail { run: Run; metrics: Metrics; annotations: Annotation[] }
 export interface Suggestion {

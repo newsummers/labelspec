@@ -15,6 +15,8 @@ def route_annotation(
         return Route.spec_gap, [annotation.missing_rule_reason or "现有标准无法覆盖或消解该 Case"]
     if annotation.ambiguous:
         return Route.ambiguous, ["现有规则同时支持多个候选标签"]
+    if annotation.needs_history:
+        return Route.review, ["需要历史人工 Case 才能稳定判断"]
     if not annotation.label or not annotation.checks.uniquely_decidable:
         return Route.spec_gap, [annotation.missing_rule_reason or "规则不足以唯一决定标签"]
 

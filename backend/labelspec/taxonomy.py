@@ -86,20 +86,6 @@ def leaf_catalog(standard: CompiledStandard) -> List[Tuple[str, LabelDefinition]
     ]
 
 
-def effective_definitions(
-    standard: CompiledStandard, candidate_label_ids: Sequence[str]
-) -> List[DefinitionRule]:
-    wanted: Set[str] = set()
-    for label_id in candidate_label_ids:
-        wanted.update(ancestors(standard, label_id))
-    by_label = {rule.label_id: rule for rule in standard.definition_rules}
-    return [
-        by_label[label.label_id]
-        for label in standard.labels.labels
-        if label.label_id in wanted and label.label_id in by_label
-    ]
-
-
 def _legacy_paths(payload: Dict[str, Any]) -> List[Tuple[str, ...]]:
     paths: List[Tuple[str, ...]] = []
     for label in payload.get("labels", {}).get("labels", []):

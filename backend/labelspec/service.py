@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from .annotator import annotate
 from .compiler import CompilerSource, compile_sources
 from .disclosure import DisclosureEngine
-from .domain import AnnotationResult, CompiledStandard
+from .domain import AnnotationDecision, AnnotationResult, CompiledStandard, DisclosureTrace
 from .documents import ParsedDocument, parse_standard_document
 from .provider import QianfanProvider
 from .router import route_annotation
@@ -155,39 +156,36 @@ class LabelSpecService:
                     self.provider, settings.annotator_model, item["text"], trace
                 )
                 if decision.needs_history:
-                    trace.historical_cases = await self.disclosure.retrieve_history(
-                        item["text"], item["id"], settings.embedding_model
+                    historical_cases = await self.disclosure.retrieve_history(
+                        item["text"],
+                        item["id"],
+                        trace.candidates,
+                        settings.embedding_model,
                     )
-                    decision = await annotate(
-                        self.provider, settings.annotator_model, item["text"], trace
-                    )
+                    if historical_cases:
+                        trace.historical_cases = historical_cases
+                        decision = await annotate(
+                            self.provider, settings.annotator_model, item["text"], trace
+                        )
+                decision = await self._ensure_valid_decision(
+                    settings.annotator_model, item["text"], trace, decision
+                )
                 verification = await verify(
                     self.provider, settings.verifier_model, item["text"], trace, decision
                 )
                 known_rule_ids = {
-                    rule.rule_id for rule in [
-                        *trace.definitions,
-                        *trace.boundaries,
-                        *trace.global_priority_rules,
-                    ]
+                    rule.rule_id
+                    for chain in trace.definitions
+                    for rule in chain.chain
+                } | {
+                    rule.rule_id for rule in [*trace.boundaries, *trace.global_priority_rules]
                 }
                 unsupported = sorted(set(decision.rules_used) - known_rule_ids)
                 verification.unsupported_rules = sorted(
                     set(verification.unsupported_rules).union(unsupported)
                 )
-                verification.rules_exist = not verification.unsupported_rules
-                used = set(decision.rules_used)
-                verification.omitted_boundary_rules = sorted(
-                    set(verification.omitted_boundary_rules).union(
-                        rule.rule_id for rule in trace.boundaries if rule.rule_id not in used
-                    )
-                )
-                verification.omitted_priority_rules = sorted(
-                    set(verification.omitted_priority_rules).union(
-                        rule.rule_id
-                        for rule in trace.global_priority_rules
-                        if rule.rule_id not in used
-                    )
+                verification.rules_exist = (
+                    verification.rules_exist and not verification.unsupported_rules
                 )
                 route, reasons = route_annotation(
                     decision, verification, settings.auto_accept_threshold
@@ -212,6 +210,131 @@ class LabelSpecService:
         except Exception as exc:
             logger.exception("Annotation run %s failed", run_id)
             self.store.update_run(run_id, status="failed", error=str(exc), completed_at=utc_now())
+
+    async def _ensure_valid_decision(
+        self,
+        model: str,
+        text: str,
+        trace: DisclosureTrace,
+        decision: AnnotationDecision,
+        max_attempts: int = 3,
+    ) -> AnnotationDecision:
+        errors = self._decision_errors(trace, decision)
+        for attempt in range(1, max_attempts):
+            if not errors:
+                return decision
+            logger.warning(
+                "Annotator 第 %d 次输出不一致：%s，重试",
+                attempt,
+                "；".join(errors),
+            )
+            valid_options = {
+                chain.leaf_path: {
+                    "leaf_rule_used": chain.chain[-1].rule_id if chain.chain else None,
+                    "path_rules_referenced": [rule.rule_id for rule in chain.chain[:-1]],
+                }
+                for chain in trace.definitions
+            }
+            correction = (
+                "上一次输出存在以下问题："
+                + "；".join(errors)
+                + "。请重新输出。合法标签及对应 Definition Rule 如下：\n"
+                + json.dumps(valid_options, ensure_ascii=False)
+            )
+            decision = await annotate(
+                self.provider, model, text, trace, correction=correction
+            )
+            errors = self._decision_errors(trace, decision)
+        if not errors:
+            return decision
+        logger.warning(
+            "Annotator 连续 %d 次输出不一致：%s，转为 spec_gap",
+            max_attempts,
+            "；".join(errors),
+        )
+        return decision.model_copy(
+            update={
+                "label": None,
+                "leaf_rule_used": None,
+                "path_rules_referenced": [],
+                "decision_rules_referenced": [],
+                "rule_reasons": {},
+                "confidence": 0.0,
+                "ambiguous": False,
+                "spec_gap": True,
+                "needs_history": False,
+                "missing_rule_reason": (
+                    f"Annotator 连续 {max_attempts} 次输出不符合决策约束："
+                    + "；".join(errors)
+                ),
+                "checks": decision.checks.model_copy(
+                    update={"uniquely_decidable": False}
+                ),
+            }
+        )
+
+    @staticmethod
+    def _decision_errors(
+        trace: DisclosureTrace, decision: AnnotationDecision
+    ) -> List[str]:
+        errors: List[str] = []
+        chains_by_path = {chain.leaf_path: chain for chain in trace.definitions}
+        all_path_rules = {
+            rule.rule_id
+            for chain in trace.definitions
+            for rule in chain.chain[:-1]
+        }
+        known_decision_rules = {
+            rule.rule_id for rule in [*trace.boundaries, *trace.global_priority_rules]
+        }
+
+        if decision.ambiguous and decision.spec_gap:
+            errors.append("ambiguous 与 spec_gap 不能同时为 true")
+        if decision.label is None:
+            if decision.leaf_rule_used is not None:
+                errors.append("label 为空时 leaf_rule_used 必须为空")
+            if not (decision.ambiguous or decision.spec_gap or decision.needs_history):
+                errors.append("未给出 label 时必须说明 ambiguous、spec_gap 或 needs_history")
+            allowed_path_rules = all_path_rules
+        else:
+            chain = chains_by_path.get(decision.label)
+            if chain is None:
+                errors.append(f"label {decision.label!r} 不在候选叶子范围内")
+                allowed_path_rules = set()
+            else:
+                expected_leaf_rule = chain.chain[-1].rule_id if chain.chain else None
+                if decision.leaf_rule_used != expected_leaf_rule:
+                    errors.append(
+                        f"label {decision.label!r} 必须使用叶子 Rule {expected_leaf_rule!r}"
+                    )
+                allowed_path_rules = {rule.rule_id for rule in chain.chain[:-1]}
+            if decision.ambiguous or decision.spec_gap:
+                errors.append("ambiguous 或 spec_gap 时 label 必须为空")
+
+        invalid_path_rules = sorted(
+            set(decision.path_rules_referenced) - allowed_path_rules
+        )
+        if invalid_path_rules:
+            errors.append(
+                "path_rules_referenced 包含非祖先 Definition Rule: "
+                + ", ".join(invalid_path_rules)
+            )
+        invalid_decision_rules = sorted(
+            set(decision.decision_rules_referenced) - known_decision_rules
+        )
+        if invalid_decision_rules:
+            errors.append(
+                "decision_rules_referenced 包含未披露 Rule: "
+                + ", ".join(invalid_decision_rules)
+            )
+        missing_reasons = [
+            rule_id
+            for rule_id in decision.rules_used
+            if not decision.rule_reasons.get(rule_id, "").strip()
+        ]
+        if missing_reasons:
+            errors.append("rule_reasons 缺少说明: " + ", ".join(missing_reasons))
+        return errors
 
     @staticmethod
     def _entity_maps(standard: CompiledStandard) -> Dict[str, Dict[str, Dict[str, Any]]]:

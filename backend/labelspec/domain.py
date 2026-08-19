@@ -149,7 +149,9 @@ class RuleChecks(BaseModel):
 
 class AnnotationDecision(BaseModel):
     label: Optional[str] = None
-    rules_used: List[str] = Field(default_factory=list)
+    leaf_rule_used: Optional[str] = None
+    path_rules_referenced: List[str] = Field(default_factory=list)
+    decision_rules_referenced: List[str] = Field(default_factory=list)
     rule_reasons: Dict[str, str] = Field(default_factory=dict)
     evidence: str
     confidence: float = Field(ge=0, le=1)
@@ -158,6 +160,15 @@ class AnnotationDecision(BaseModel):
     needs_history: bool = False
     missing_rule_reason: Optional[str] = None
     checks: RuleChecks
+
+    @property
+    def rules_used(self) -> List[str]:
+        values = [
+            *([self.leaf_rule_used] if self.leaf_rule_used else []),
+            *self.path_rules_referenced,
+            *self.decision_rules_referenced,
+        ]
+        return list(dict.fromkeys(values))
 
 
 class VerificationDecision(BaseModel):
@@ -169,15 +180,21 @@ class VerificationDecision(BaseModel):
     omitted_priority_rules: List[str] = Field(default_factory=list)
     unsupported_rules: List[str] = Field(default_factory=list)
     confidence: float = Field(ge=0, le=1)
-    verdict: str
+    verdict: Literal["PASS", "UNCERTAIN", "REJECT"]
     explanation: str
+
+
+class DefinitionChain(BaseModel):
+    leaf_label_id: str
+    leaf_path: str
+    chain: List[DefinitionRule]
 
 
 class DisclosureTrace(BaseModel):
     label_map: List[LabelDefinition]
     global_priority_rules: List[PriorityRule]
     candidates: List[str]
-    definitions: List[DefinitionRule]
+    definitions: List[DefinitionChain]
     boundaries: List[BoundaryRule]
     historical_cases: List[Dict[str, Any]] = Field(default_factory=list)
 
