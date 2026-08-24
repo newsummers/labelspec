@@ -1,56 +1,67 @@
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
-from .domain import AnnotationDecision, Route, VerificationDecision
+from .domain import AnnotationDecision, Route, RouteReason, VerificationDecision
+
+
+def _reason(code: str, source: str, message: str) -> RouteReason:
+    return RouteReason(code=code, source=source, message=message)
 
 
 def route_annotation(
     annotation: AnnotationDecision,
-    verifier: VerificationDecision,
-    threshold: float,
-) -> Tuple[Route, List[str]]:
-    reasons: List[str] = []
-    if annotation.spec_gap:
-        return Route.spec_gap, [annotation.missing_rule_reason or "现有标准无法覆盖或消解该 Case"]
-    if annotation.ambiguous:
-        return Route.ambiguous, ["现有规则同时支持多个候选标签"]
-    if annotation.needs_history:
-        return Route.review, ["需要历史人工 Case 才能稳定判断"]
-    if not annotation.label or not annotation.checks.uniquely_decidable:
-        return Route.spec_gap, [annotation.missing_rule_reason or "规则不足以唯一决定标签"]
+    verifier: Optional[VerificationDecision] = None,
+    threshold: float = 0.85,
+) -> Tuple[Route, List[RouteReason]]:
+    """Route a labeled decision using deterministic signals only.
 
-    hard_failures = []
-    if not verifier.rules_exist or verifier.unsupported_rules:
-        hard_failures.append("Annotator 引用了不存在或不适用的 Rule")
-    if verifier.omitted_boundary_rules:
-        hard_failures.append("遗漏适用的 Boundary Rule")
-    if verifier.omitted_priority_rules:
-        hard_failures.append("遗漏适用的 Priority Rule")
-    if verifier.exclude_triggered:
-        hard_failures.append("最终标签触发了 Exclude")
-    if verifier.verdict == "REJECT" or not verifier.label_supported:
-        hard_failures.append("Verifier 不支持最终标签")
-    if hard_failures:
-        return Route.review, hard_failures
-
-    effective_confidence = min(annotation.confidence, verifier.confidence)
-    if verifier.verdict != "PASS":
-        reasons.append("Verifier 结论不稳定")
-    if effective_confidence < threshold:
-        reasons.append(f"有效置信度 {effective_confidence:.2f} 低于阈值 {threshold:.2f}")
-    checks = annotation.checks
-    if not all(
-        [
-            checks.definition_matched,
-            checks.excludes_checked,
-            checks.alternatives_checked,
-            checks.boundaries_checked,
-            checks.priorities_checked,
-            checks.uniquely_decidable,
+    ``verifier`` remains an optional argument for callers that still use the
+    old API, but it is deliberately ignored by new runs.
+    """
+    reasons: List[RouteReason] = []
+    # Compatibility for callers of the removed Verifier API. Production
+    # annotation runs do not pass a verifier payload.
+    if verifier is not None:
+        blocking = [issue for issue in verifier.issues if issue.severity == "BLOCKING"]
+        if blocking:
+            return Route.review, [
+                _reason(
+                    issue.code,
+                    "VERIFIER",
+                    f"{issue.rule_id}: {issue.message}" if issue.rule_id else issue.message,
+                )
+                for issue in blocking
+            ]
+    if annotation.status.value in {"AMBIGUOUS", "SPEC_GAP", "NEEDS_CONTEXT"}:
+        return Route.review, [
+            _reason(annotation.status.value, "ANNOTATOR", annotation.reason)
         ]
-    ):
-        reasons.append("Rule 完整性检查未全部通过")
-    if reasons:
+    if not annotation.label or not annotation.leaf_rule_used:
+        return Route.review, [
+            _reason("INVALID_LABEL", "ROUTER", "标注结果没有提供合法标签，必须人工审核")
+        ]
+
+    for code in annotation.review_reason_codes:
+        reasons.append(_reason(code, "ANNOTATOR", annotation.reason))
+    if annotation.needs_review:
+        if not reasons:
+            reasons.append(_reason("ANNOTATOR_REVIEW", "ANNOTATOR", annotation.reason))
         return Route.review, reasons
-    return Route.auto_accept, ["规则充分、Annotator 与 Verifier 一致且置信度达标"]
+
+    if annotation.confidence < threshold:
+        return Route.review, [
+            _reason(
+                "LOW_CONFIDENCE",
+                "ROUTER",
+                f"Annotator 置信度 {annotation.confidence:.2f} 低于自动通过阈值 {threshold:.2f}；{annotation.reason}",
+            )
+        ]
+
+    return Route.auto_accept, [
+        _reason(
+            "AUTO_ACCEPT",
+            "ROUTER",
+            "标签属于当前 Standard 的合法叶子，原文证据和规则依据完整，置信度达到自动通过阈值",
+        )
+    ]

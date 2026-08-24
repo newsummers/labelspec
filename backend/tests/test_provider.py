@@ -51,6 +51,57 @@ async def test_chat_does_not_apply_client_timeout(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_reports_usage_to_observer(monkeypatch) -> None:
+    records = []
+
+    class FakeResponse:
+        headers = {"x-request-id": "req-1"}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "id": "response-1",
+                "choices": [{"message": {"content": "{}"}}],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 20,
+                    "total_tokens": 120,
+                    "prompt_tokens_details": {"cached_tokens": 8},
+                },
+            }
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, *args, **kwargs):
+            return FakeResponse()
+
+    async def observer(record):
+        records.append(record)
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    provider = QianfanProvider(AppSettings(qianfan_api_key="test"))
+    provider.set_call_observer(observer)
+    with provider.telemetry_context(run_id="run-1", item_id="item-1", stage="ANNOTATOR", model_role="annotator"):
+        assert await provider._chat({"model": "test"}) == "{}"
+
+    assert records[0]["request_id"] == "req-1"
+    assert records[0]["input_tokens"] == 100
+    assert records[0]["output_tokens"] == 20
+    assert records[0]["cached_input_tokens"] == 8
+    assert records[0]["stage"] == "ANNOTATOR"
+
+
+@pytest.mark.asyncio
 async def test_malformed_structured_output_is_repaired() -> None:
     class RepairProvider(QianfanProvider):
         def __init__(self):

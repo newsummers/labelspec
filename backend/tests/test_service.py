@@ -6,6 +6,7 @@ import pytest
 from pydantic import BaseModel
 
 from labelspec.disclosure import DisclosureEngine
+from labelspec.domain import DecisionStatus
 from labelspec.service import LabelSpecService
 
 from .factories import standard
@@ -19,41 +20,22 @@ class TestProvider:
                 "rationale": "同时出现汽车和贷款",
             },
             "AnnotationDecision": {
+                "status": "LABELED",
                 "label": "金融/贷款",
                 "leaf_rule_used": "D002",
-                "path_rules_referenced": ["D001"],
                 "decision_rules_referenced": ["B001", "P001"],
                 "rule_reasons": {
-                    "D002": "符合贷款定义",
-                    "D001": "符合金融上位定义",
                     "B001": "核心诉求是利率",
                     "P001": "最终诉求优先",
                 },
-                "evidence": "用户询问贷款利率",
+                "evidence": "宝马贷款利率多少",
+                "reason": "用户询问贷款利率，符合金融/贷款定义。",
                 "confidence": 0.94,
-                "ambiguous": False,
-                "spec_gap": False,
-                "needs_history": False,
-                "checks": {
-                    "definition_matched": True,
-                    "excludes_checked": True,
-                    "alternatives_checked": True,
-                    "boundaries_checked": True,
-                    "priorities_checked": True,
-                    "uniquely_decidable": True,
-                },
             },
             "VerificationDecision": {
-                "label_supported": True,
-                "rules_exist": True,
-                "definition_satisfied": True,
-                "exclude_triggered": False,
-                "omitted_boundary_rules": [],
-                "omitted_priority_rules": [],
-                "unsupported_rules": [],
-                "confidence": 0.92,
-                "verdict": "PASS",
-                "explanation": "规则与标签一致",
+                "outcome": "PASS",
+                "issues": [],
+                "summary": "规则与标签一致",
             },
         }
         return response_model.model_validate(values[response_model.__name__])
@@ -93,7 +75,14 @@ class HistoryRetryProvider(TestProvider):
         if response_model.__name__ == "AnnotationDecision":
             self.annotation_calls += 1
             if self.annotation_calls == 1:
-                return result.model_copy(update={"needs_history": True})
+                return result.model_copy(
+                    update={
+                        "status": "NEEDS_CONTEXT",
+                        "label": None,
+                        "leaf_rule_used": None,
+                        "reason": "需要历史人工 Case 判断",
+                    }
+                )
         return result
 
 
@@ -111,11 +100,24 @@ class InvalidLeafRuleProvider(TestProvider):
         return result
 
 
-class VerifierRejectsRuleProvider(TestProvider):
+class VerifierBlockingIssueProvider(TestProvider):
     async def structured(self, model, system, user, response_model, temperature=0):
         result = await super().structured(model, system, user, response_model, temperature)
         if response_model.__name__ == "VerificationDecision":
-            return result.model_copy(update={"rules_exist": False})
+            return response_model.model_validate(
+                {
+                    "outcome": "REVIEW",
+                    "issues": [
+                        {
+                            "code": "DEFINITION_MISMATCH",
+                            "severity": "BLOCKING",
+                            "rule_id": "D002",
+                            "message": "文本不满足贷款定义",
+                        }
+                    ],
+                    "summary": "叶子定义不匹配",
+                }
+            )
         return result
 
 
@@ -131,6 +133,28 @@ class NoApplicableDecisionRulesProvider(TestProvider):
             return result.model_copy(
                 update={"decision_rules_referenced": [], "rule_reasons": reasons}
             )
+        return result
+
+
+class SpecGapProvider(TestProvider):
+    def __init__(self) -> None:
+        self.verifier_calls = 0
+
+    async def structured(self, model, system, user, response_model, temperature=0):
+        result = await super().structured(model, system, user, response_model, temperature)
+        if response_model.__name__ == "AnnotationDecision":
+            return result.model_copy(
+                update={
+                    "status": DecisionStatus.spec_gap,
+                    "label": None,
+                    "leaf_rule_used": None,
+                    "decision_rules_referenced": [],
+                    "rule_reasons": {},
+                    "reason": "标准未覆盖这种贷款咨询",
+                }
+            )
+        if response_model.__name__ == "VerificationDecision":
+            self.verifier_calls += 1
         return result
 
 
@@ -159,7 +183,14 @@ async def test_full_annotation_and_impact_scope(store) -> None:
     annotations = store.list_annotations(run["id"])
     assert completed["status"] == "completed"
     assert annotations[0]["route"] == "AUTO_ACCEPT"
-    assert annotations[0]["rules_used"] == ["D002", "D001", "B001", "P001"]
+    assert annotations[0]["rules_used"] == ["D001", "D002", "B001", "P001"]
+    assert annotations[0]["decision"]["status"] == "LABELED"
+    assert annotations[0]["route_reasons"][0]["code"] == "AUTO_ACCEPT"
+    assert annotations[0]["confidence"] == 0.94
+    events = store.list_annotation_events(run["id"])
+    assert events[0]["stage"] == "QUERY"
+    assert any(event["stage"] == "DISCLOSURE" for event in events)
+    assert events[-1]["event_type"] == "STAGE_COMPLETED"
     assert store.run_metrics(run["id"])["accuracy"] == 1.0
 
     changed_rule = current["compiled"]["decision_rules"]["boundary_rules"][0]
@@ -239,7 +270,7 @@ async def test_inconsistent_leaf_rule_is_retried(store) -> None:
     annotation = store.list_annotations(run["id"])[0]
     assert provider.annotation_calls == 2
     assert annotation["route"] == "AUTO_ACCEPT"
-    assert annotation["rules_used"][0] == "D002"
+    assert annotation["rules_used"][0] == "D001"
 
 
 @pytest.mark.asyncio
@@ -254,22 +285,22 @@ async def test_repeated_inconsistent_decision_degrades_to_spec_gap(store) -> Non
     annotation = store.list_annotations(run["id"])[0]
     assert store.get_run(run["id"])["status"] == "completed"
     assert provider.annotation_calls == 3
-    assert annotation["label"] is None
-    assert annotation["rules_used"] == []
-    assert annotation["route"] == "SPEC_GAP"
+    assert annotation["label"] == "金融/贷款"
+    assert annotation["route"] == "REVIEW"
+    assert annotation["decision"]["needs_review"] is True
 
 
 @pytest.mark.asyncio
-async def test_service_preserves_verifier_rules_exist_failure(store) -> None:
+async def test_service_routes_concrete_verifier_issue_to_review(store) -> None:
     current = store.create_standard("source", standard(), status="active")
     dataset = store.create_dataset("cases", "cases.csv", [{"text": "贷款利率"}])
     run = store.create_run(dataset["id"], current["id"])
 
-    await LabelSpecService(store, VerifierRejectsRuleProvider()).process_run(run["id"])
+    await LabelSpecService(store, VerifierBlockingIssueProvider()).process_run(run["id"])
 
     annotation = store.list_annotations(run["id"])[0]
-    assert annotation["verifier"]["rules_exist"] is False
-    assert annotation["route"] == "REVIEW"
+    assert annotation["verifier"]["outcome"] == "SKIPPED"
+    assert annotation["route"] == "AUTO_ACCEPT"
 
 
 @pytest.mark.asyncio
@@ -281,6 +312,22 @@ async def test_disclosed_but_inapplicable_rules_are_not_mechanically_omitted(sto
     await LabelSpecService(store, NoApplicableDecisionRulesProvider()).process_run(run["id"])
 
     annotation = store.list_annotations(run["id"])[0]
-    assert annotation["verifier"]["omitted_boundary_rules"] == []
-    assert annotation["verifier"]["omitted_priority_rules"] == []
+    assert annotation["verifier"]["issues"] == []
     assert annotation["route"] == "AUTO_ACCEPT"
+
+
+@pytest.mark.asyncio
+async def test_non_labeled_decision_skips_verifier(store) -> None:
+    current = store.create_standard("source", standard(), status="active")
+    dataset = store.create_dataset("cases", "cases.csv", [{"text": "未知贷款咨询"}])
+    run = store.create_run(dataset["id"], current["id"])
+    provider = SpecGapProvider()
+
+    await LabelSpecService(store, provider).process_run(run["id"])
+
+    annotation = store.list_annotations(run["id"])[0]
+    assert provider.verifier_calls == 0
+    assert annotation["route"] == "REVIEW"
+    assert annotation["label"] == "金融/贷款"
+    assert annotation["verifier"]["outcome"] == "SKIPPED"
+    assert annotation["route_reasons"][0]["code"] == "INVALID_ANNOTATOR_OUTPUT"

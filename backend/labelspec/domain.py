@@ -3,12 +3,14 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class Route(str, Enum):
     auto_accept = "AUTO_ACCEPT"
     review = "REVIEW"
+    # Legacy values are kept only so historical rows can still be read. New
+    # annotation runs never emit them.
     ambiguous = "AMBIGUOUS"
     spec_gap = "SPEC_GAP"
 
@@ -17,6 +19,13 @@ class RuleType(str, Enum):
     definition = "definition"
     boundary = "boundary"
     priority = "priority"
+
+
+class DecisionStatus(str, Enum):
+    labeled = "LABELED"
+    ambiguous = "AMBIGUOUS"
+    spec_gap = "SPEC_GAP"
+    needs_context = "NEEDS_CONTEXT"
 
 
 class SourceReference(BaseModel):
@@ -126,7 +135,6 @@ class ValidationReport(BaseModel):
 class ModelSettings(BaseModel):
     compiler_model: str = "ernie-4.5-turbo-128k"
     annotator_model: str = "ernie-4.5-turbo-128k"
-    verifier_model: str = "ernie-4.5-turbo-128k"
     miner_model: str = "ernie-4.5-turbo-128k"
     embedding_model: str = "Embedding-V1"
     auto_accept_threshold: float = Field(default=0.85, ge=0, le=1)
@@ -138,50 +146,74 @@ class CandidateDecision(BaseModel):
     rationale: str
 
 
-class RuleChecks(BaseModel):
-    definition_matched: bool
-    excludes_checked: bool
-    alternatives_checked: bool
-    boundaries_checked: bool
-    priorities_checked: bool
-    uniquely_decidable: bool
-
-
 class AnnotationDecision(BaseModel):
+    # status is retained for backwards-compatible reads. New writes always
+    # use LABELED because every result must carry a legal label.
+    status: DecisionStatus = DecisionStatus.labeled
     label: Optional[str] = None
     leaf_rule_used: Optional[str] = None
-    path_rules_referenced: List[str] = Field(default_factory=list)
     decision_rules_referenced: List[str] = Field(default_factory=list)
     rule_reasons: Dict[str, str] = Field(default_factory=dict)
-    evidence: str
+    evidence: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
     confidence: float = Field(ge=0, le=1)
-    ambiguous: bool = False
-    spec_gap: bool = False
-    needs_history: bool = False
-    missing_rule_reason: Optional[str] = None
-    checks: RuleChecks
+    needs_review: bool = False
+    review_reason_codes: List[str] = Field(default_factory=list)
+    evidence_items: List[Dict[str, Any]] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def status_matches_label(self) -> "AnnotationDecision":
+        if self.status == DecisionStatus.labeled and (not self.label or not self.leaf_rule_used):
+            raise ValueError("标注结果必须同时提供 label 与 leaf_rule_used")
+        if self.needs_review and not self.reason.strip():
+            raise ValueError("需要审核的标注必须提供可读的审核理由")
+        return self
 
     @property
     def rules_used(self) -> List[str]:
         values = [
             *([self.leaf_rule_used] if self.leaf_rule_used else []),
-            *self.path_rules_referenced,
             *self.decision_rules_referenced,
         ]
         return list(dict.fromkeys(values))
 
 
+class VerificationIssue(BaseModel):
+    code: Literal[
+        "DEFINITION_MISMATCH",
+        "EXCLUDE_HIT",
+        "BETTER_CANDIDATE",
+        "MISSED_DECISION_RULE",
+        "UNGROUNDED_EVIDENCE",
+        "INVALID_RULE_REFERENCE",
+        "OTHER",
+    ]
+    severity: Literal["BLOCKING", "WARNING"] = "BLOCKING"
+    rule_id: Optional[str] = None
+    message: str = Field(min_length=1)
+
+
 class VerificationDecision(BaseModel):
-    label_supported: bool
-    rules_exist: bool
-    definition_satisfied: bool
-    exclude_triggered: bool
-    omitted_boundary_rules: List[str] = Field(default_factory=list)
-    omitted_priority_rules: List[str] = Field(default_factory=list)
-    unsupported_rules: List[str] = Field(default_factory=list)
-    confidence: float = Field(ge=0, le=1)
-    verdict: Literal["PASS", "UNCERTAIN", "REJECT"]
-    explanation: str
+    outcome: Literal["PASS", "REVIEW", "SKIPPED"]
+    issues: List[VerificationIssue] = Field(default_factory=list)
+    summary: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def outcome_matches_issues(self) -> "VerificationDecision":
+        blocking = any(issue.severity == "BLOCKING" for issue in self.issues)
+        if self.outcome == "PASS" and blocking:
+            raise ValueError("PASS 不能包含 BLOCKING issue")
+        if self.outcome == "REVIEW" and not blocking:
+            raise ValueError("REVIEW 必须包含至少一个 BLOCKING issue")
+        if self.outcome == "SKIPPED" and self.issues:
+            raise ValueError("SKIPPED 不能包含 issue")
+        return self
+
+
+class RouteReason(BaseModel):
+    code: str = Field(min_length=1)
+    source: Literal["ANNOTATOR", "VERIFIER", "ROUTER"]
+    message: str = Field(min_length=1)
 
 
 class DefinitionChain(BaseModel):
@@ -202,16 +234,19 @@ class DisclosureTrace(BaseModel):
 class AnnotationResult(BaseModel):
     item_id: str
     text: str
-    label: Optional[str]
+    label: str = Field(min_length=1)
     candidates: List[str]
     rules_used: List[str]
     rule_reasons: Dict[str, str]
     evidence: str
     confidence: float
     route: Route
-    route_reasons: List[str]
+    route_reasons: List[RouteReason]
+    decision: AnnotationDecision
     disclosure: DisclosureTrace
-    verifier: VerificationDecision
+    # Legacy verifier payload is optional; it is no longer produced by the
+    # annotation pipeline.
+    verifier: Optional[VerificationDecision] = None
 
 
 class MinerSuggestion(BaseModel):
@@ -222,3 +257,4 @@ class MinerSuggestion(BaseModel):
     problem: str
     target_rule_id: Optional[str] = None
     proposed_change: str
+    operations: List[Dict[str, Any]] = Field(min_length=1)

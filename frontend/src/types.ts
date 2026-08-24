@@ -79,7 +79,45 @@ export interface Run {
   status: 'queued' | 'running' | 'completed' | 'failed'
   total: number
   processed: number
+  current_item_id?: string
+  current_stage?: string
   error?: string
+  created_at: string
+}
+export interface TraceEvent {
+  id: string
+  run_id: string
+  item_id?: string
+  sequence: number
+  stage: string
+  event_type: string
+  status: 'running' | 'success' | 'error'
+  message: string
+  duration_ms?: number | null
+  model_role?: string | null
+  model_id?: string | null
+  metadata: Record<string, unknown>
+  created_at: string
+}
+export interface ModelCall {
+  id: string
+  run_id?: string
+  item_id?: string
+  stage: string
+  operation: string
+  attempt: number
+  model_role?: string
+  model_id?: string
+  duration_ms: number
+  input_tokens?: number | null
+  output_tokens?: number | null
+  total_tokens?: number | null
+  cached_input_tokens?: number | null
+  reasoning_tokens?: number | null
+  request_id?: string | null
+  status: string
+  error?: string | null
+  usage: Record<string, unknown>
   created_at: string
 }
 export interface Metrics {
@@ -89,7 +127,6 @@ export interface Metrics {
   accuracy_sample_size: number
   auto_accept_rate: number
   review_rate: number
-  rule_conflict_rate: number
 }
 export interface Annotation {
   id: string
@@ -105,16 +142,33 @@ export interface Annotation {
   evidence: string
   confidence: number
   route: Route
-  route_reasons: string[]
+  route_reasons: Array<{
+    code: string
+    source: 'ANNOTATOR' | 'VERIFIER' | 'ROUTER'
+    message: string
+  }>
+  decision: {
+    status: 'LABELED' | 'AMBIGUOUS' | 'SPEC_GAP' | 'NEEDS_CONTEXT'
+    label?: string
+    leaf_rule_used?: string
+    decision_rules_referenced: string[]
+    rule_reasons: Record<string, string>
+    evidence: string
+    reason: string
+    confidence: number
+    needs_review?: boolean
+    review_reason_codes?: string[]
+    evidence_items?: Array<Record<string, unknown>>
+  }
   disclosure: {
+    candidates: string[]
     definitions: DefinitionChain[]
     boundaries: BoundaryRule[]
     global_priority_rules: PriorityRule[]
     historical_cases: Array<Record<string, unknown>>
   }
-  verifier: { verdict: 'PASS' | 'UNCERTAIN' | 'REJECT'; explanation: string; confidence: number }
 }
-export interface RunDetail { run: Run; metrics: Metrics; annotations: Annotation[] }
+export interface RunDetail { run: Run; metrics: Metrics; annotations: Annotation[]; events: TraceEvent[]; model_calls: ModelCall[] }
 export interface Suggestion {
   id: string
   run_id: string
@@ -128,12 +182,22 @@ export interface Suggestion {
     problem: string
     target_rule_id?: string
     proposed_change: string
+    operations?: Array<Record<string, unknown>>
   }
+  patch?: RulePatch
+}
+export interface RulePatch {
+  id: string
+  standard_id: string
+  source_run_id?: string
+  status: 'proposed' | 'approved' | 'rejected' | 'applied'
+  payload: { operations?: Array<Record<string, unknown>>; reason?: string; [key: string]: unknown }
+  related_feedback_ids: string[]
+  applied_standard_id?: string
 }
 export interface ModelSettings {
   compiler_model: string
   annotator_model: string
-  verifier_model: string
   miner_model: string
   embedding_model: string
   auto_accept_threshold: number

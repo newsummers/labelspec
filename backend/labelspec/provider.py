@@ -1,14 +1,25 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional, Type, TypeVar
+import inspect
+import logging
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Type, TypeVar
 
 import httpx
 from pydantic import BaseModel, ValidationError
 
 from .config import AppSettings
 
+logger = logging.getLogger(__name__)
+
 T = TypeVar("T", bound=BaseModel)
+CallObserver = Callable[[Dict[str, Any]], Awaitable[None]]
+_telemetry_context: ContextVar[Dict[str, Any]] = ContextVar(
+    "labelspec_telemetry_context", default={}
+)
 
 
 class ProviderError(RuntimeError):
@@ -22,6 +33,20 @@ class MissingApiKeyError(ProviderError):
 class QianfanProvider:
     def __init__(self, settings: AppSettings):
         self.settings = settings
+        self._call_observer: Optional[CallObserver] = None
+
+    def set_call_observer(self, observer: Optional[CallObserver]) -> None:
+        self._call_observer = observer
+
+    @contextmanager
+    def telemetry_context(self, **values: Any):
+        current = dict(_telemetry_context.get())
+        current.update({key: value for key, value in values.items() if value is not None})
+        token = _telemetry_context.set(current)
+        try:
+            yield
+        finally:
+            _telemetry_context.reset(token)
 
     @property
     def configured(self) -> bool:
@@ -71,7 +96,7 @@ class QianfanProvider:
             "response_format": {"type": "json_schema", "json_schema": schema},
         }
         try:
-            content = await self._chat(payload)
+            content = await self._structured_chat(payload, response_model.__name__, 1)
         except ProviderError as exc:
             # Some Qianfan-hosted models do not support json_schema. They can still
             # be used with JSON mode, followed by strict local validation.
@@ -82,7 +107,7 @@ class QianfanProvider:
                 "\n只输出合法 JSON，且必须严格满足以下 JSON Schema：\n"
                 + json.dumps(schema, ensure_ascii=False)
             )
-            content = await self._chat(payload)
+            content = await self._structured_chat(payload, response_model.__name__, 2)
         last_error: Optional[Exception] = None
         for repair_attempt in range(3):
             try:
@@ -96,7 +121,7 @@ class QianfanProvider:
                         f"模型连续 3 次返回不符合 {response_model.__name__} 的内容: "
                         f"{exc}; response={excerpt!r}"
                     ) from exc
-                content = await self._chat(
+                content = await self._structured_chat(
                     {
                         "model": model,
                         "messages": [
@@ -118,7 +143,9 @@ class QianfanProvider:
                         "temperature": 0,
                         "enable_thinking": False,
                         "response_format": {"type": "json_object"},
-                    }
+                    },
+                    f"{response_model.__name__}_REPAIR",
+                    repair_attempt + 1,
                 )
         raise ProviderError(
             f"模型返回内容不符合 {response_model.__name__} 结构: {last_error}"
@@ -131,6 +158,7 @@ class QianfanProvider:
         async with httpx.AsyncClient(timeout=None) as client:
             for start in range(0, len(inputs), 16):
                 batch = inputs[start : start + 16]
+                started = time.perf_counter()
                 try:
                     response = await client.post(
                         f"{self.settings.qianfan_base_url.rstrip('/')}/embeddings",
@@ -139,31 +167,149 @@ class QianfanProvider:
                     )
                     response.raise_for_status()
                 except httpx.HTTPError as exc:
+                    await self._record_call(
+                        operation="embeddings",
+                        attempt=start // 16 + 1,
+                        model=model,
+                        started=started,
+                        status="error",
+                        error=self._http_error("Embedding 请求失败", exc),
+                    )
                     raise ProviderError(self._http_error("Embedding 请求失败", exc)) from exc
-                rows = sorted(response.json().get("data", []), key=lambda row: row.get("index", 0))
+                payload = response.json()
+                rows = sorted(payload.get("data", []), key=lambda row: row.get("index", 0))
                 vectors.extend(row.get("embedding", []) for row in rows)
+                await self._record_call(
+                    operation="embeddings",
+                    attempt=start // 16 + 1,
+                    model=model,
+                    started=started,
+                    status="success",
+                    usage=payload.get("usage") or {},
+                    request_id=self._request_id(response, payload),
+                )
         if len(vectors) != len(inputs) or any(not vector for vector in vectors):
             raise ProviderError("Embedding 返回数量或向量内容不完整")
         return vectors
 
-    async def _chat(self, payload: Dict[str, Any]) -> str:
+    async def _chat(
+        self,
+        payload: Dict[str, Any],
+        operation: str = "chat",
+        attempt: int = 1,
+    ) -> str:
         # Large structured compilations can legitimately take several minutes.
         # An unlimited timeout lets the provider decide whether the request can
         # be completed instead of truncating it locally at an arbitrary limit.
-        async with httpx.AsyncClient(timeout=None) as client:
-            try:
+        started = time.perf_counter()
+        response: Optional[httpx.Response] = None
+        response_payload: Dict[str, Any] = {}
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
                 response = await client.post(
                     f"{self.settings.qianfan_base_url.rstrip('/')}/chat/completions",
                     headers=self._headers(),
                     json=payload,
                 )
                 response.raise_for_status()
-            except httpx.HTTPError as exc:
-                raise ProviderError(self._http_error("文本生成请求失败", exc)) from exc
+            response_payload = response.json()
+            content = response_payload["choices"][0]["message"]["content"]
+        except httpx.HTTPError as exc:
+            message = self._http_error("文本生成请求失败", exc)
+            await self._record_call(
+                operation=operation, attempt=attempt, model=payload.get("model", ""),
+                started=started, status="error", error=message,
+            )
+            raise ProviderError(message) from exc
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            message = "千帆返回了无法识别的响应结构"
+            await self._record_call(
+                operation=operation, attempt=attempt, model=payload.get("model", ""),
+                started=started, status="error", error=f"{message}: {exc}",
+            )
+            raise ProviderError(message) from exc
+        await self._record_call(
+            operation=operation,
+            attempt=attempt,
+            model=payload.get("model", ""),
+            started=started,
+            status="success",
+            usage=response_payload.get("usage") or {},
+            request_id=self._request_id(response, response_payload),
+        )
+        return content
+
+    async def _structured_chat(
+        self, payload: Dict[str, Any], operation: str, attempt: int
+    ) -> str:
+        # Keep compatibility with lightweight provider test doubles that override
+        # the historical one-argument _chat method.
+        parameters = inspect.signature(self._chat).parameters
+        if "operation" not in parameters:
+            return await self._chat(payload)
+        return await self._chat(payload, operation=operation, attempt=attempt)
+
+    async def _record_call(
+        self,
+        operation: str,
+        attempt: int,
+        model: str,
+        started: float,
+        status: str,
+        usage: Optional[Dict[str, Any]] = None,
+        request_id: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        if not self._call_observer:
+            return
+        normalized = self._normalize_usage(usage or {})
+        context = dict(_telemetry_context.get())
+        record = {
+            **context,
+            "stage": context.get("stage", "UNKNOWN"),
+            "operation": operation,
+            "attempt": attempt,
+            "model_id": model,
+            "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+            "status": status,
+            "request_id": request_id,
+            "error": error,
+            "usage": usage or {},
+            **normalized,
+        }
         try:
-            return response.json()["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise ProviderError("千帆返回了无法识别的响应结构") from exc
+            result = self._call_observer(record)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:  # telemetry must never break the model request
+            logger.exception("记录模型调用指标失败")
+
+    @staticmethod
+    def _request_id(response: Optional[httpx.Response], payload: Dict[str, Any]) -> Optional[str]:
+        if response is not None:
+            headers = getattr(response, "headers", {})
+            value = headers.get("x-request-id") or headers.get("request-id")
+            if value:
+                return value
+        value = payload.get("id") or payload.get("request_id")
+        return str(value) if value else None
+
+    @staticmethod
+    def _normalize_usage(usage: Dict[str, Any]) -> Dict[str, Optional[int]]:
+        details = usage.get("prompt_tokens_details") or usage.get("prompt_token_details") or {}
+        cached = (
+            usage.get("cached_input_tokens")
+            or usage.get("cache_read_input_tokens")
+            or details.get("cached_tokens")
+        )
+        reasoning = usage.get("reasoning_tokens") or usage.get("completion_tokens_details", {}).get("reasoning_tokens")
+        return {
+            "input_tokens": usage.get("prompt_tokens") or usage.get("input_tokens"),
+            "output_tokens": usage.get("completion_tokens") or usage.get("output_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+            "cached_input_tokens": cached,
+            "reasoning_tokens": reasoning,
+        }
 
     @staticmethod
     def _extract_json(content: Any) -> Any:

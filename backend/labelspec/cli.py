@@ -35,7 +35,6 @@ def serve(host: str = "127.0.0.1", port: int = 8000, reload: bool = False) -> No
 def settings_command(
     compiler_model: Optional[str] = None,
     annotator_model: Optional[str] = None,
-    verifier_model: Optional[str] = None,
     miner_model: Optional[str] = None,
     embedding_model: Optional[str] = None,
     auto_accept_threshold: Optional[float] = None,
@@ -47,7 +46,6 @@ def settings_command(
     updates = {
         "compiler_model": compiler_model,
         "annotator_model": annotator_model,
-        "verifier_model": verifier_model,
         "miner_model": miner_model,
         "embedding_model": embedding_model,
         "auto_accept_threshold": auto_accept_threshold,
@@ -222,8 +220,12 @@ def export_results_command(
         {
             "id": row["item_id"], "text": row["text"],
             "label": row.get("human_label") or row.get("label"), "route": row["route"],
+            "decision_status": row["decision"]["status"],
+            "decision_reason": row["decision"]["reason"],
+            "route_reasons": row["route_reasons"],
             "rules_used": row["rules_used"], "evidence": row["evidence"],
-            "confidence": row["confidence"], "gold_label": row.get("gold_label"),
+            "confidence": row["confidence"],
+            "gold_label": row.get("gold_label"),
         }
         for row in rows
     ]
@@ -231,10 +233,23 @@ def export_results_command(
         output.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in values) + "\n", encoding="utf-8")
     elif output.suffix.lower() == ".csv":
         with output.open("w", encoding="utf-8-sig", newline="") as stream:
-            writer = csv.DictWriter(stream, fieldnames=list(values[0]) if values else ["id", "text", "label", "route", "rules_used", "evidence", "confidence", "gold_label"])
+            writer = csv.DictWriter(
+                stream,
+                fieldnames=list(values[0]) if values else [
+                    "id", "text", "label", "route", "decision_status", "decision_reason",
+                    "route_reasons", "rules_used", "evidence", "confidence",
+                    "gold_label",
+                ],
+            )
             writer.writeheader()
             for row in values:
-                writer.writerow({**row, "rules_used": "|".join(row["rules_used"])})
+                writer.writerow({
+                    **row,
+                    "rules_used": "|".join(row["rules_used"]),
+                    "route_reasons": "|".join(
+                        reason["message"] for reason in row["route_reasons"]
+                    ),
+                })
     else:
         raise typer.BadParameter("Output suffix must be .csv or .jsonl")
     console.print(f"Exported {len(values)} rows to {output.resolve()}")

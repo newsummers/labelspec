@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import asyncio
 import io
 import json
 import logging
@@ -11,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -68,6 +69,8 @@ class RunRequest(BaseModel):
 class ReviewRequest(BaseModel):
     human_label: str = Field(min_length=1)
     note: str = ""
+    reason_code: str = "MANUAL_REVIEW"
+    rule_feedback: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class RuleRevisionRequest(BaseModel):
@@ -76,6 +79,13 @@ class RuleRevisionRequest(BaseModel):
     reason: str = Field(min_length=2)
     related_case_ids: List[str] = Field(default_factory=list)
     suggestion_id: Optional[str] = None
+
+
+class RulePatchRequest(BaseModel):
+    standard_id: str
+    payload: Dict[str, Any]
+    related_feedback_ids: List[str] = Field(default_factory=list)
+    source_run_id: Optional[str] = None
 
 
 class ManualVersionRequest(BaseModel):
@@ -461,9 +471,46 @@ def run_detail(run_id: str) -> Dict[str, Any]:
             "run": store.get_run(run_id),
             "metrics": store.run_metrics(run_id),
             "annotations": store.list_annotations(run_id),
+            "events": store.list_annotation_events(run_id),
+            "model_calls": store.list_model_calls(run_id),
         }
     except Exception as exc:
         raise _handle_error(exc) from exc
+
+
+@app.get("/api/runs/{run_id}/events")
+async def run_events(run_id: str, after: int = 0) -> StreamingResponse:
+    """Stream durable query/model events; reconnects can resume from sequence."""
+    try:
+        store.get_run(run_id)
+    except Exception as exc:
+        raise _handle_error(exc) from exc
+
+    async def stream():
+        cursor = max(after, 0)
+        while True:
+            events = store.list_annotation_events(run_id, after=cursor)
+            for event in events:
+                cursor = event["sequence"]
+                yield f"id: {cursor}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+            try:
+                run = store.get_run(run_id)
+            except KeyError:
+                return
+            if run["status"] in {"completed", "failed"} and not events:
+                return
+            yield ": keep-alive\n\n"
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/api/runs/{run_id}/export")
@@ -480,7 +527,10 @@ def export_run(run_id: str, format: str = "jsonl", gold_only: bool = False) -> R
                 "id": item["item_id"],
                 "text": item["text"],
                 "label": item.get("human_label") or item.get("label"),
+                "decision_status": item["decision"]["status"],
+                "decision_reason": item["decision"]["reason"],
                 "route": item["route"],
+                "route_reasons": item["route_reasons"],
                 "rules_used": item["rules_used"],
                 "evidence": item["evidence"],
                 "confidence": item["confidence"],
@@ -498,11 +548,20 @@ def export_run(run_id: str, format: str = "jsonl", gold_only: bool = False) -> R
             )
         if format == "csv":
             stream = io.StringIO()
-            fields = ["id", "text", "label", "route", "rules_used", "evidence", "confidence", "gold_label"]
+            fields = [
+                "id", "text", "label", "decision_status", "decision_reason", "route",
+                "route_reasons", "rules_used", "evidence", "confidence", "gold_label",
+            ]
             writer = csv.DictWriter(stream, fieldnames=fields)
             writer.writeheader()
             for row in rows:
-                writer.writerow({**row, "rules_used": "|".join(row["rules_used"])})
+                writer.writerow({
+                    **row,
+                    "rules_used": "|".join(row["rules_used"]),
+                    "route_reasons": "|".join(
+                        reason["message"] for reason in row["route_reasons"]
+                    ),
+                })
             return Response(
                 content="\ufeff" + stream.getvalue(),
                 media_type="text/csv",
@@ -516,7 +575,76 @@ def export_run(run_id: str, format: str = "jsonl", gold_only: bool = False) -> R
 @app.post("/api/annotations/{annotation_id}/review")
 def review(annotation_id: str, payload: ReviewRequest) -> Dict[str, Any]:
     try:
-        return store.review_annotation(annotation_id, payload.human_label, payload.note)
+        return store.review_annotation(
+            annotation_id,
+            payload.human_label,
+            payload.note,
+            payload.reason_code,
+            payload.rule_feedback,
+        )
+    except Exception as exc:
+        raise _handle_error(exc) from exc
+
+
+@app.get("/api/feedback")
+def feedback(run_id: Optional[str] = None, standard_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    return store.list_feedback(run_id=run_id, standard_id=standard_id)
+
+
+@app.post("/api/rule-patches")
+def create_rule_patch(payload: RulePatchRequest) -> Dict[str, Any]:
+    try:
+        store.get_standard(payload.standard_id)
+        return store.save_rule_patch(
+            payload.standard_id,
+            payload.payload,
+            payload.related_feedback_ids,
+            payload.source_run_id,
+        )
+    except Exception as exc:
+        raise _handle_error(exc) from exc
+
+
+@app.get("/api/rule-patches")
+def rule_patches(standard_id: Optional[str] = None, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    return store.list_rule_patches(standard_id=standard_id, status=status)
+
+
+@app.patch("/api/rule-patches/{patch_id}")
+def update_rule_patch(patch_id: str, status: str) -> Dict[str, Any]:
+    try:
+        if status == "applied":
+            raise ValueError("Rule Patch 必须通过 apply 接口生效，不能直接标记 applied")
+        return store.update_rule_patch_status(patch_id, status)
+    except Exception as exc:
+        raise _handle_error(exc) from exc
+
+
+@app.post("/api/rule-patches/{patch_id}/apply")
+def apply_rule_patch(patch_id: str, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+    try:
+        result = service.apply_rule_patch(patch_id)
+        patch = result["patch"]
+        source_run_id = patch.get("source_run_id")
+        operations = patch.get("payload", {}).get("operations", [])
+        rule_id = next(
+            (
+                operation.get("rule_id") or operation.get("after", {}).get("rule_id")
+                for operation in operations
+                if operation.get("rule_id") or operation.get("after", {}).get("rule_id")
+            ),
+            "PATCH",
+        )
+        if source_run_id:
+            impact = service.create_impact_run(
+                source_run_id,
+                result["standard"]["id"],
+                rule_id,
+                result.get("affected_labels", []),
+            )
+            background_tasks.add_task(service.process_run, impact["id"])
+            result["impact_run"] = impact
+        return result
     except Exception as exc:
         raise _handle_error(exc) from exc
 

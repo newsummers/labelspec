@@ -101,3 +101,79 @@ def test_standard_source_roles_are_persisted(store) -> None:
         source_document_roles=["definition", "boundary"],
     )
     assert [item["role"] for item in saved["sources"]] == ["definition", "boundary"]
+
+
+def test_legacy_annotation_payload_is_normalized_on_read(store) -> None:
+    saved = store.create_standard("source", standard(), status="active")
+    dataset = store.create_dataset("cases", "cases.csv", [{"text": "贷款利率"}])
+    item = store.list_items(dataset["id"])[0]
+    run = store.create_run(dataset["id"], saved["id"])
+
+    annotation = store.save_annotation(
+        run["id"],
+        {
+            "item_id": item["id"],
+            "label": "金融/贷款",
+            "candidates": ["金融/贷款"],
+            "rules_used": ["D002"],
+            "rule_reasons": {"D002": "符合贷款定义"},
+            "evidence": "贷款利率",
+            "confidence": 0.9,
+            "route": "AUTO_ACCEPT",
+            "route_reasons": ["历史自动通过"],
+            "disclosure": {},
+            "verifier": {
+                "verdict": "PASS",
+                "explanation": "历史核验通过",
+                "confidence": 0.88,
+            },
+        },
+    )
+
+    assert annotation["route_reasons"] == [
+        {"code": "LEGACY", "source": "ROUTER", "message": "历史自动通过"}
+    ]
+    assert annotation["verifier"]["outcome"] == "PASS"
+    assert annotation["decision"]["status"] == "LABELED"
+    assert annotation["decision"]["leaf_rule_used"] == "D002"
+
+
+def test_trace_events_and_model_calls_are_persisted(store) -> None:
+    saved = store.create_standard("source", standard(), status="active")
+    dataset = store.create_dataset("trace-cases", "cases.csv", [{"text": "贷款利率"}])
+    run = store.create_run(dataset["id"], saved["id"])
+
+    started = store.save_annotation_event(
+        run["id"], "item-1", "ANNOTATOR", "STAGE_STARTED", "running", "开始决策",
+        model_role="annotator", model_id="test-model",
+    )
+    completed = store.save_annotation_event(
+        run["id"], "item-1", "ANNOTATOR", "STAGE_COMPLETED", "success", "完成决策",
+        duration_ms=123.4, model_role="annotator", model_id="test-model",
+    )
+    call = store.save_model_call(
+        {
+            "run_id": run["id"],
+            "item_id": "item-1",
+            "stage": "ANNOTATOR",
+            "operation": "AnnotationDecision",
+            "attempt": 1,
+            "model_role": "annotator",
+            "model_id": "test-model",
+            "duration_ms": 123.4,
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 120,
+            "cached_input_tokens": 8,
+            "status": "success",
+            "usage": {"prompt_tokens": 100, "completion_tokens": 20},
+        }
+    )
+
+    events = store.list_annotation_events(run["id"])
+    calls = store.list_model_calls(run["id"], "item-1")
+    assert [event["sequence"] for event in events] == [started["sequence"], completed["sequence"]]
+    assert events[1]["duration_ms"] == 123.4
+    assert calls[0]["total_tokens"] == 120
+    assert calls[0]["usage"]["prompt_tokens"] == 100
+    assert call["id"] == calls[0]["id"]

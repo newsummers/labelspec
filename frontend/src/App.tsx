@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   AlertTriangle, ArrowRight, BarChart3, Check, ChevronRight, CircleGauge, Database,
   FileCode2, FileDown, FlaskConical, GitBranch, GitCompareArrows, Layers3, Lightbulb, LoaderCircle,
@@ -8,7 +8,7 @@ import {
 } from 'lucide-react'
 import { api } from './api'
 import type {
-  Annotation, CompiledStandard, Dataset, DocumentRole, Metrics, ModelSettings, Route, Run, RunDetail, StandardSummary,
+  Annotation, CompiledStandard, Dataset, DocumentRole, Metrics, ModelCall, ModelSettings, Route, Run, RunDetail, StandardSummary, TraceEvent,
   Suggestion,
 } from './types'
 
@@ -28,7 +28,8 @@ function date(value?: string) {
   return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(value))
 }
 function pct(value?: number | null) { return value == null ? '-' : `${(value * 100).toFixed(1)}%` }
-function Badge({ value }: { value: string }) { return <span className={`badge ${value}`}>{value}</span> }
+function ms(value?: number | null) { return value == null ? '-' : value < 1000 ? `${Math.round(value)} ms` : `${(value / 1000).toFixed(1)} s` }
+function Badge({ value, className = '' }: { value: string; className?: string }) { return <span className={`badge ${value} ${className}`.trim()}>{value}</span> }
 function Spinner() { return <span className="spinner" /> }
 function Empty({ icon: Icon = Layers3, title, text }: { icon?: typeof Layers3; title: string; text?: string }) {
   return <div className="empty"><div><Icon size={24} /><div className="empty-title">{title}</div>{text && <div className="empty-text">{text}</div>}</div></div>
@@ -110,14 +111,14 @@ function Dashboard({ standards, datasets, runs, setPage }: { standards: Standard
       <div className="metric"><div className="metric-label"><ShieldCheck size={14} />自动通过率</div><div className="metric-value">{pct(metrics?.auto_accept_rate)}</div><div className="metric-foot">最近完成运行</div></div>
       <div className="metric"><div className="metric-label"><CircleGauge size={14} />准确率</div><div className="metric-value">{pct(metrics?.accuracy)}</div><div className="metric-foot">{metrics?.accuracy_sample_size || 0} 条人工真值</div></div>
       <div className="metric"><div className="metric-label"><AlertTriangle size={14} />人工审核率</div><div className="metric-value">{pct(metrics?.review_rate)}</div><div className="metric-foot">REVIEW 路由</div></div>
-      <div className="metric"><div className="metric-label"><GitCompareArrows size={14} />Rule 冲突率</div><div className="metric-value">{pct(metrics?.rule_conflict_rate)}</div><div className="metric-foot">AMBIGUOUS + SPEC_GAP</div></div>
+      <div className="metric"><div className="metric-label"><GitCompareArrows size={14} />待确认反馈</div><div className="metric-value">{metrics?.routes.REVIEW || 0}</div><div className="metric-foot">REVIEW 条目</div></div>
     </div>
     <div className="flow">
       {[
         ['01', 'Standard', active ? `v${active.version} · ${active.counts.labels} Labels` : '未激活'],
         ['02', 'Data', `${datasets.reduce((sum, item) => sum + item.item_count, 0)} Cases`],
         ['03', 'Model', runs[0] ? `${runs[0].processed}/${runs[0].total}` : '未运行'],
-        ['04', 'Failure', `${(metrics?.routes.REVIEW || 0) + (metrics?.routes.AMBIGUOUS || 0) + (metrics?.routes.SPEC_GAP || 0)} Cases`],
+        ['04', 'Review', `${metrics?.routes.REVIEW || 0} Cases`],
         ['05', 'Standard', standards.length > 1 ? `${standards.length} Versions` : '等待进化'],
       ].map(step => <div className="flow-step" key={step[0]}><div className="flow-number">{step[0]}</div><div className="flow-title">{step[1]}</div><div className="flow-meta">{step[2]}</div></div>)}
     </div>
@@ -369,9 +370,101 @@ function DatasetsPage({ datasets, standards, refresh, notify, setPage }: { datas
   </>
 }
 
+type TokenSummary = { input: number; output: number; total: number; cached: number; reasoning: number; cost: number }
+type ModelSummary = TokenSummary & { calls: number; duration: number; models: string[]; retries: number; failures: number }
+type QueryMonitor = {
+  id: string
+  text: string
+  status: string
+  stage: string
+  route?: Route
+  label?: string
+  decisionStatus?: Annotation['decision']['status']
+  confidence?: number
+  duration: number | null
+  tokens: TokenSummary
+  annotator: ModelSummary
+  stages: string[]
+  events: TraceEvent[]
+  modelCalls: ModelCall[]
+}
+
+const monitorStageOrder = ['QUERY', 'DISCLOSURE', 'ANNOTATOR', 'ANNOTATOR_VALIDATE', 'ROUTER', 'PERSIST']
+const modelPricing: Record<string, { input: number; output: number }> = {
+  'deepseek-v4-flash-0731': { input: 0.001, output: 0.002 },
+  'qwen3-embedding-8b': { input: 0.0005, output: 0.0005 },
+}
+
+function emptyTokenSummary(): TokenSummary { return { input: 0, output: 0, total: 0, cached: 0, reasoning: 0, cost: 0 } }
+function emptyModelSummary(): ModelSummary { return { ...emptyTokenSummary(), calls: 0, duration: 0, models: [], retries: 0, failures: 0 } }
+function addCall(summary: ModelSummary, call: ModelCall) {
+  summary.calls += 1
+  summary.duration += call.duration_ms || 0
+  summary.input += call.input_tokens || 0
+  summary.output += call.output_tokens || 0
+  summary.total += call.total_tokens ?? ((call.input_tokens || 0) + (call.output_tokens || 0))
+  summary.cached += call.cached_input_tokens || 0
+  summary.reasoning += call.reasoning_tokens || 0
+  const pricing = call.model_id ? modelPricing[call.model_id] : undefined
+  if (pricing) summary.cost += ((call.input_tokens || 0) * pricing.input + (call.output_tokens || 0) * pricing.output) / 1000
+  if (call.model_id && !summary.models.includes(call.model_id)) summary.models.push(call.model_id)
+  if ((call.attempt || 1) > 1) summary.retries += 1
+  if (call.status !== 'success') summary.failures += 1
+}
+function aggregateCalls(calls: ModelCall[]): { total: TokenSummary; annotator: ModelSummary } {
+  const total = emptyTokenSummary(); const annotator = emptyModelSummary()
+  calls.forEach(call => {
+    total.input += call.input_tokens || 0
+    total.output += call.output_tokens || 0
+    total.total += call.total_tokens ?? ((call.input_tokens || 0) + (call.output_tokens || 0))
+    total.cached += call.cached_input_tokens || 0
+    total.reasoning += call.reasoning_tokens || 0
+    const pricing = call.model_id ? modelPricing[call.model_id] : undefined
+    if (pricing) total.cost += ((call.input_tokens || 0) * pricing.input + (call.output_tokens || 0) * pricing.output) / 1000
+    if (call.model_role === 'annotator') addCall(annotator, call)
+  })
+  return { total, annotator }
+}
+function queryMonitors(items: Array<{ id: string; text: string }>, detail: RunDetail | null): QueryMonitor[] {
+  if (!detail) return []
+  const annotations = new Map(detail.annotations.map(item => [item.item_id, item]))
+  const itemIds = new Set(items.map(item => item.id))
+  detail.events.forEach(event => { if (event.item_id) itemIds.add(event.item_id) })
+  detail.model_calls.forEach(call => { if (call.item_id) itemIds.add(call.item_id) })
+  const itemText = new Map(items.map(item => [item.id, item.text]))
+  return Array.from(itemIds).map(id => {
+    const events = detail.events.filter(event => event.item_id === id).sort((a, b) => a.sequence - b.sequence)
+    const modelCalls = detail.model_calls.filter(call => call.item_id === id)
+    const annotation = annotations.get(id)
+    const queryStart = events.find(event => event.stage === 'QUERY' && event.event_type === 'STAGE_STARTED')
+    const queryEnd = events.find(event => event.stage === 'QUERY' && event.event_type === 'STAGE_COMPLETED')
+    const started = queryStart ? new Date(queryStart.created_at).getTime() : 0
+    const ended = queryEnd ? new Date(queryEnd.created_at).getTime() : Date.now()
+    const lastEvent = events[events.length - 1]
+    const stage = annotation ? 'COMPLETED' : lastEvent?.stage || (id === detail.run.current_item_id ? detail.run.current_stage || 'QUERY' : 'QUEUED')
+    const completed = Boolean(annotation || queryEnd)
+    const stages = Array.from(new Set(events.filter(event => event.stage !== 'RUN').map(event => event.stage)))
+      .sort((a, b) => monitorStageOrder.indexOf(a) - monitorStageOrder.indexOf(b))
+    const summaries = aggregateCalls(modelCalls)
+    return {
+      id, text: itemText.get(id) || `Item ${id.slice(0, 8)}`, status: completed ? (annotation?.route || 'completed') : id === detail.run.current_item_id ? 'running' : stage === 'QUEUED' ? 'queued' : 'running',
+      stage, route: annotation?.route, label: annotation?.label, decisionStatus: annotation?.decision.status, confidence: annotation?.confidence,
+      duration: started ? Math.max(0, ended - started) : null, tokens: summaries.total,
+      annotator: summaries.annotator, stages, events, modelCalls,
+    }
+  }).sort((a, b) => {
+    const ai = items.findIndex(item => item.id === a.id); const bi = items.findIndex(item => item.id === b.id)
+    return (ai < 0 ? Number.MAX_SAFE_INTEGER : ai) - (bi < 0 ? Number.MAX_SAFE_INTEGER : bi)
+  })
+}
+function tokenText(tokens: TokenSummary) { return `输入 ${tokens.input.toLocaleString()} · 输出 ${tokens.output.toLocaleString()} · 缓存 ${tokens.cached.toLocaleString()}` }
+function costText(value: number) { return `¥${value.toFixed(4)}` }
+function modelSummaryText(summary: ModelSummary) { return `${summary.calls} 次 · ${ms(summary.duration)} · ${tokenText(summary)} · ${costText(summary.cost)}` }
+
 function RunsPage({ runs, refresh, notify }: { runs: Run[]; refresh: () => Promise<void>; notify: (text: string, error?: boolean) => void }) {
   const [selectedId, setSelectedId] = useState(runs[0]?.id || '')
   const [detail, setDetail] = useState<RunDetail | null>(null)
+  const [items, setItems] = useState<Array<{ id: string; text: string }>>([])
   const [filter, setFilter] = useState<Route | 'ALL'>('ALL')
   const [annotation, setAnnotation] = useState<Annotation | null>(null)
   const [reviewLabel, setReviewLabel] = useState('')
@@ -379,33 +472,108 @@ function RunsPage({ runs, refresh, notify }: { runs: Run[]; refresh: () => Promi
   const [compareIds, setCompareIds] = useState<[string, string]>(['', ''])
   const [comparison, setComparison] = useState<{ left: { run: Run; metrics: Metrics }; right: { run: Run; metrics: Metrics } } | null>(null)
   const [retrying, setRetrying] = useState(false)
+  const detailRef = useRef<RunDetail | null>(null)
+  useEffect(() => { detailRef.current = detail }, [detail])
   useEffect(() => { if (!selectedId && runs[0]) setSelectedId(runs[0].id) }, [runs, selectedId])
   const loadDetail = useCallback(async () => { if (selectedId) try { setDetail(await api.run(selectedId)) } catch (error) { notify(error instanceof Error ? error.message : '加载失败', true) } }, [selectedId, notify])
+  useEffect(() => {
+    if (!detail?.run.dataset_id) { setItems([]); return }
+    void api.datasetItems(detail.run.dataset_id).then(value => setItems(value.map(item => ({ id: item.id, text: item.text })))).catch(() => setItems([]))
+  }, [detail?.run.dataset_id])
   useEffect(() => { void loadDetail() }, [loadDetail, runs])
+  useEffect(() => {
+    const current = detailRef.current
+    if (!selectedId || !current || !['queued', 'running'].includes(current.run.status)) return
+    const after = current.events.length ? current.events[current.events.length - 1].sequence : 0
+    const source = new EventSource(`/api/runs/${selectedId}/events?after=${after}`)
+    source.onmessage = event => {
+      try {
+        const trace = JSON.parse(event.data)
+        setDetail(previous => {
+          if (!previous || previous.events.some(item => item.id === trace.id)) return previous
+          const events = [...previous.events, trace]
+          let modelCalls = previous.model_calls
+          const callId = trace.metadata?.model_call_id
+          if (trace.event_type === 'MODEL_CALL_COMPLETED' && callId && !modelCalls.some(item => item.id === callId)) {
+            const usage = trace.metadata?.usage || {}
+            modelCalls = [...modelCalls, {
+              id: callId, run_id: trace.run_id, item_id: trace.item_id, stage: trace.stage,
+              operation: trace.metadata?.operation || 'model', attempt: trace.metadata?.attempt || 1,
+              model_role: trace.model_role || undefined, model_id: trace.model_id || undefined,
+              duration_ms: trace.duration_ms || 0, input_tokens: usage.input_tokens ?? null,
+              output_tokens: usage.output_tokens ?? null, total_tokens: usage.total_tokens ?? null,
+              cached_input_tokens: usage.cached_input_tokens ?? null, reasoning_tokens: usage.reasoning_tokens ?? null,
+              request_id: trace.metadata?.request_id || null, status: trace.status,
+              error: trace.metadata?.error || null, usage, created_at: trace.created_at,
+            }]
+          }
+          const run = { ...previous.run }
+          if (trace.stage === 'QUERY' && trace.event_type === 'STAGE_COMPLETED') run.processed = trace.metadata?.index || run.processed
+          if (trace.stage && trace.item_id && ['STAGE_STARTED', 'MODEL_CALL_COMPLETED'].includes(trace.event_type)) { run.current_item_id = trace.item_id; run.current_stage = trace.stage }
+          return { ...previous, run, events, model_calls: modelCalls }
+        })
+        if (trace.stage === 'QUERY' && trace.event_type === 'STAGE_COMPLETED') { void loadDetail(); void refresh() }
+      } catch { /* ignore malformed event and keep the stream alive */ }
+    }
+    source.onerror = () => source.close()
+    return () => source.close()
+  }, [selectedId, detail?.run.status, loadDetail, refresh])
   async function review() { if (!annotation || !reviewLabel) return; try { await api.review(annotation.id, reviewLabel, reviewNote); notify('人工审核已保存'); setAnnotation(null); await loadDetail() } catch (error) { notify(error instanceof Error ? error.message : '保存失败', true) } }
   async function compare() { if (!compareIds[0] || !compareIds[1]) return; try { setComparison(await api.compare(compareIds[0], compareIds[1])) } catch (error) { notify(error instanceof Error ? error.message : '对比失败', true) } }
   async function retry() { if (!detail || detail.run.status !== 'failed') return; setRetrying(true); try { await api.retryRun(detail.run.id); notify(`已从 ${detail.run.processed}/${detail.run.total} 继续运行`); await refresh(); await loadDetail() } catch (error) { notify(error instanceof Error ? error.message : '继续运行失败', true) } finally { setRetrying(false) } }
   const filtered = detail?.annotations.filter(item => filter === 'ALL' || item.route === filter) || []
+  const monitors = useMemo(() => queryMonitors(items, detail), [items, detail])
+  const runTokens = monitors.reduce<TokenSummary>((sum, item) => ({ input: sum.input + item.tokens.input, output: sum.output + item.tokens.output, total: sum.total + item.tokens.total, cached: sum.cached + item.tokens.cached, reasoning: sum.reasoning + item.tokens.reasoning, cost: sum.cost + item.tokens.cost }), emptyTokenSummary())
+  const runDuration = monitors.reduce((sum, item) => sum + (item.duration || 0), 0)
+  const annotationCallSummary = annotation ? aggregateCalls((detail?.model_calls || []).filter(call => call.item_id === annotation.item_id)) : null
+  const candidatePaths = annotation?.disclosure.candidates || annotation?.disclosure.definitions.map(item => item.leaf_path) || []
   return <>
-    <PageHead title="标注运行" meta={`${runs.length} 次运行`}>{detail?.run.status === 'completed' && <><a className="btn" href={`/api/runs/${detail.run.id}/export?format=csv`}><Upload size={15} style={{ transform: 'rotate(180deg)' }} />导出结果</a><a className="btn" href={`/api/runs/${detail.run.id}/export?format=jsonl&gold_only=true`}><ShieldCheck size={15} />导出 Gold</a></>}{detail?.run.status === 'failed' && <button className="btn primary" disabled={retrying} onClick={() => void retry()}>{retrying ? <Spinner /> : <Play size={15} />}继续运行</button>}<button className="btn" onClick={() => void refresh()}><RefreshCw size={15} />刷新</button></PageHead>
-    <div className="split">
-      <div className="panel">{runs.length ? <div className="list">{runs.map(run => <button key={run.id} className={`list-item ${selectedId === run.id ? 'selected' : ''}`} onClick={() => setSelectedId(run.id)}><div className="list-title">{run.dataset_name}</div><div className="list-meta"><Badge value={run.status} /><span>Standard v{run.standard_version}</span><span>{run.processed}/{run.total}</span></div>{run.status === 'running' && <div className="progress" style={{ marginTop: 9 }}><span style={{ width: `${run.total ? run.processed / run.total * 100 : 0}%` }} /></div>}{run.error && <div className="list-meta" style={{ color: 'var(--red)' }}>{run.error}</div>}</button>)}</div> : <Empty icon={ScanSearch} title="暂无运行" />}</div>
-      <div className="stack">{detail ? <>
-        <div className="four-col"><div className="metric"><div className="metric-label">自动通过率</div><div className="metric-value">{pct(detail.metrics.auto_accept_rate)}</div></div><div className="metric"><div className="metric-label">准确率</div><div className="metric-value">{pct(detail.metrics.accuracy)}</div><div className="metric-foot">n={detail.metrics.accuracy_sample_size}</div></div><div className="metric"><div className="metric-label">审核率</div><div className="metric-value">{pct(detail.metrics.review_rate)}</div></div><div className="metric"><div className="metric-label">冲突率</div><div className="metric-value">{pct(detail.metrics.rule_conflict_rate)}</div></div></div>
-        <div className="panel"><div className="panel-head"><h2>标注结果</h2><select className="select" style={{ width: 155 }} value={filter} onChange={event => setFilter(event.target.value as Route | 'ALL')}><option value="ALL">全部路由</option>{['AUTO_ACCEPT', 'REVIEW', 'AMBIGUOUS', 'SPEC_GAP'].map(value => <option key={value}>{value}</option>)}</select></div>{filtered.length ? <div className="table-wrap" style={{ maxHeight: 620 }}><table><thead><tr><th>文本</th><th>Label</th><th>Rules</th><th>置信度</th><th>路由</th><th></th></tr></thead><tbody>{filtered.map(item => <tr key={item.id}><td className="text-cell">{item.text}</td><td>{item.human_label || item.label || '-'}</td><td><div className="rules">{item.rules_used.map(rule => <span className="rule-chip" key={rule}>{rule}</span>)}</div></td><td className="confidence">{item.confidence.toFixed(2)}</td><td><Badge value={item.route} /></td><td><button className="btn icon ghost" title="查看" onClick={() => { setAnnotation(item); setReviewLabel(item.human_label || item.label || ''); setReviewNote(item.review_note || '') }}><ChevronRight size={15} /></button></td></tr>)}</tbody></table></div> : <Empty title={detail.run.status === 'completed' ? '没有匹配的标注结果' : '运行处理中'} />}</div>
-      </> : <Empty title="选择一次运行" />}</div>
+    <PageHead title="标注运行" meta={`${runs.length} 次运行`}><select className="select run-selector" aria-label="选择标注运行" title="选择标注运行" value={selectedId} onChange={event => setSelectedId(event.target.value)} disabled={!runs.length}><option value="">选择运行</option>{runs.map(run => <option key={run.id} value={run.id}>{run.dataset_name} · v{run.standard_version} · {run.status}</option>)}</select>{detail?.run.status === 'completed' && <><a className="btn" href={`/api/runs/${detail.run.id}/export?format=csv`}><Upload size={15} style={{ transform: 'rotate(180deg)' }} />导出结果</a><a className="btn" href={`/api/runs/${detail.run.id}/export?format=jsonl&gold_only=true`}><ShieldCheck size={15} />导出 Gold</a></>}{detail?.run.status === 'failed' && <button className="btn primary" disabled={retrying} onClick={() => void retry()}>{retrying ? <Spinner /> : <Play size={15} />}继续运行</button>}<button className="btn" onClick={() => void refresh()}><RefreshCw size={15} />刷新</button></PageHead>
+    <div className="run-detail-layout">{detail ? <>
+        <div className="four-col"><div className="metric"><div className="metric-label">自动通过率</div><div className="metric-value">{pct(detail.metrics.auto_accept_rate)}</div></div><div className="metric"><div className="metric-label">准确率</div><div className="metric-value">{pct(detail.metrics.accuracy)}</div><div className="metric-foot">n={detail.metrics.accuracy_sample_size}</div></div><div className="metric"><div className="metric-label">审核率</div><div className="metric-value">{pct(detail.metrics.review_rate)}</div></div><div className="metric"><div className="metric-label">人工反馈</div><div className="metric-value">{detail.metrics.routes.REVIEW || 0}</div></div></div>
+        <QueryMonitorPanel monitors={monitors} run={detail.run} runTokens={runTokens} runDuration={runDuration} />
+        <div className="panel"><div className="panel-head"><h2>标注结果</h2><select className="select" style={{ width: 155 }} value={filter} onChange={event => setFilter(event.target.value as Route | 'ALL')}><option value="ALL">全部路由</option>{['AUTO_ACCEPT', 'REVIEW'].map(value => <option key={value}>{value}</option>)}</select></div>{filtered.length ? <div className="table-wrap" style={{ maxHeight: 620 }}><table><thead><tr><th>文本</th><th>Label</th><th>Rules</th><th>置信度</th><th>路由</th><th></th></tr></thead><tbody>{filtered.map(item => <tr key={item.id}><td className="text-cell">{item.text}</td><td>{item.human_label || item.label || '-'}</td><td><div className="rules">{item.rules_used.map(rule => <span className="rule-chip" key={rule}>{rule}</span>)}</div></td><td className="confidence">{item.confidence.toFixed(2)}</td><td><Badge value={item.route} className={item.route === 'REVIEW' && Boolean(item.human_label) ? 'reviewed' : ''} /></td><td><button className="btn icon ghost" title="查看" onClick={() => { setAnnotation(item); setReviewLabel(item.human_label || item.label || ''); setReviewNote(item.review_note || '') }}><ChevronRight size={15} /></button></td></tr>)}</tbody></table></div> : <Empty title={detail.run.status === 'completed' ? '没有匹配的标注结果' : '运行处理中'} />}</div>
+      </> : <Empty title="选择一次运行" />}
     </div>
     {runs.filter(item => item.status === 'completed').length >= 2 && <div className="panel" style={{ marginTop: 16 }}><div className="panel-head"><h2>版本对比</h2><GitCompareArrows size={16} /></div><div className="panel-body"><div className="field-row" style={{ gridTemplateColumns: '1fr 1fr auto' }}><select className="select" value={compareIds[0]} onChange={event => setCompareIds([event.target.value, compareIds[1]])}><option value="">基准运行</option>{runs.filter(item => item.status === 'completed').map(item => <option key={item.id} value={item.id}>{item.dataset_name} · v{item.standard_version}</option>)}</select><select className="select" value={compareIds[1]} onChange={event => setCompareIds([compareIds[0], event.target.value])}><option value="">对比运行</option>{runs.filter(item => item.status === 'completed').map(item => <option key={item.id} value={item.id}>{item.dataset_name} · v{item.standard_version}</option>)}</select><button className="btn" onClick={() => void compare()} disabled={!compareIds[0] || !compareIds[1]}>对比</button></div>{comparison && <CompareView value={comparison} />}</div></div>}
-    {annotation && <Modal title="标注详情" onClose={() => setAnnotation(null)} footer={<><button className="btn" onClick={() => setAnnotation(null)}>关闭</button><button className="btn primary" disabled={!reviewLabel} onClick={() => void review()}><Save size={14} />保存审核</button></>}>
-      <dl className="detail-grid"><dt>文本</dt><dd>{annotation.text}</dd><dt>模型 Label</dt><dd>{annotation.label || '-'}</dd><dt>路由</dt><dd><Badge value={annotation.route} /></dd><dt>证据</dt><dd>{annotation.evidence}</dd><dt>Verifier</dt><dd><Badge value={annotation.verifier.verdict} /> {annotation.verifier.explanation}</dd><dt>路由原因</dt><dd>{annotation.route_reasons.join('；')}</dd><dt>Rules Used</dt><dd><div className="rules">{annotation.rules_used.map(rule => <span className="rule-chip" key={rule}>{rule}</span>)}</div></dd></dl>
+    {annotation && <Modal title="标注详情" wide onClose={() => setAnnotation(null)} footer={<><button className="btn" onClick={() => setAnnotation(null)}>关闭</button><button className="btn primary" disabled={!reviewLabel} onClick={() => void review()}><Save size={14} />保存审核</button></>}>
+      <dl className="detail-grid"><dt>文本</dt><dd>{annotation.text}</dd><dt>建议 Label</dt><dd>{annotation.label || '-'}</dd><dt>路由</dt><dd><Badge value={annotation.route} /></dd><dt>判断理由</dt><dd>{annotation.decision.reason}</dd><dt>原文证据</dt><dd>{annotation.evidence}</dd><dt>候选召回</dt><dd><div className="candidate-chain-list">{candidatePaths.length ? candidatePaths.map((candidate, candidateIndex) => { const definition = annotation.disclosure.definitions.find(item => item.leaf_path === candidate); const selected = candidate === annotation.label; return <div className={`candidate-chain ${selected ? 'selected' : ''}`} key={candidate}><div className="candidate-chain-head"><span className="candidate-index">候选 {candidateIndex + 1}</span><strong>{candidate}</strong>{selected && <span className="candidate-selected">当前建议</span>}</div>{definition?.chain.length ? <div className="candidate-chain-rules">{definition.chain.map((rule, index) => <div className="candidate-chain-rule" key={rule.rule_id}><span className="rule-chip">{rule.rule_id}</span><span className="candidate-level">{index === definition.chain.length - 1 ? '叶子定义' : `第 ${index + 1} 层`}</span><span>{rule.definition}</span></div>)}</div> : <div className="muted">未记录该候选的层级 Definition</div>}</div> }) : <span className="muted">没有记录候选召回结果</span>}</div></dd><dt>规则证据</dt><dd>{annotation.decision.evidence_items?.length ? <div className="stack" style={{ gap: 6 }}>{annotation.decision.evidence_items.map((item, index) => <div key={index}>{String(item.rule_id || item.type || 'evidence')}：{String(item.explanation || item.quote || item.rule_text || '')}</div>)}</div> : '暂无结构化规则证据'}</dd><dt>路由原因</dt><dd><div className="stack" style={{ gap: 6 }}>{annotation.route_reasons.map((reason, index) => <div key={`${reason.code}-${index}`}><span className="rule-chip">{reason.source}</span><span className="rule-chip">{reason.code}</span> {reason.message}</div>)}</div></dd><dt>模型汇总</dt><dd>{annotationCallSummary && <div className="stack" style={{ gap: 5 }}><div>Annotator：{modelSummaryText(annotationCallSummary.annotator)}</div><div>总计：{tokenText(annotationCallSummary.total)} · {costText(annotationCallSummary.total.cost)}</div></div>}</dd><dt>Rules Used</dt><dd><div className="rules">{annotation.rules_used.map(rule => <span className="rule-chip" key={rule}>{rule}</span>)}</div></dd></dl>
       <div className="field"><label>人工 Label</label><input className="input" value={reviewLabel} onChange={event => setReviewLabel(event.target.value)} /></div><div className="field"><label>审核备注</label><textarea className="textarea" value={reviewNote} onChange={event => setReviewNote(event.target.value)} /></div>
     </Modal>}
   </>
 }
 
+function QueryMonitorPanel({ monitors, run, runTokens, runDuration }: { monitors: QueryMonitor[]; run: Run; runTokens: TokenSummary; runDuration: number }) {
+  const current = monitors.find(item => item.id === run.current_item_id)
+  return <div className="panel monitor-panel">
+    <div className="panel-head"><div><h2>标注进度</h2><div className="list-meta"><Badge value={run.current_stage || run.status} />{current && <span>当前：{current.text.slice(0, 42)}{current.text.length > 42 ? '…' : ''}</span>}<span>{monitors.length}/{run.total} 条</span></div></div><div className="monitor-total monitor-total-table"><div className="monitor-total-row monitor-total-head"><span>标注总耗时</span><span>输入 Token</span><span>输出 Token</span><span>缓存 Token</span><span>费用</span></div><div className="monitor-total-row monitor-total-values"><strong>{ms(runDuration)}</strong><strong>{runTokens.input.toLocaleString()}</strong><strong>{runTokens.output.toLocaleString()}</strong><strong>{runTokens.cached.toLocaleString()}</strong><strong>{costText(runTokens.cost)}</strong></div></div></div>
+    {monitors.length ? <div className="query-monitor-list"><div className="query-monitor-head"><span>文本</span><span>标注标签</span><span>路由 / 进度</span><span>耗时</span><span>Token</span><span>费用</span><span /></div>{monitors.map(item => <details className="query-monitor" key={item.id}>
+      <summary className="query-monitor-summary">
+        <span className="query-monitor-text" title={item.text}>{item.text}</span>
+        <span className={`query-label ${item.label ? '' : 'empty-label'}`}>{item.label || (item.decisionStatus ? `未给标签 · ${item.decisionStatus}` : '待产出')}</span>
+        <span className="query-state"><Badge value={item.status} /><small>{item.stage}</small></span>
+        <span className="query-duration"><strong>{ms(item.duration)}</strong><small>Annotator {ms(item.annotator.duration)}</small></span>
+        <span className="query-token">{tokenText(item.tokens)}</span>
+        <span className="query-cost">{costText(item.tokens.cost)}</span>
+      </summary>
+      <div className="query-monitor-detail">
+        <div className="query-flow">{(item.stages.length ? item.stages : ['QUERY']).map(stage => <span className={`query-flow-step ${stage === item.stage ? 'current' : ''}`} key={stage}>{stage}</span>)}</div>
+        <div className="three-col monitor-summary-grid">
+          <div className="monitor-summary"><div className="monitor-summary-title">Annotator</div><strong>{modelSummaryText(item.annotator)}</strong><small>{item.annotator.models.join(', ') || '暂无模型记录'}{item.annotator.retries ? ` · 重试 ${item.annotator.retries}` : ''}</small></div>
+          <div className="monitor-summary"><div className="monitor-summary-title">Query 总计</div><strong>{ms(item.duration)} · {item.tokens.total.toLocaleString()} tokens · {costText(item.tokens.cost)}</strong><small>{item.label || '未产出标签'}{item.route ? ` · ${item.route}` : ''}</small></div>
+        </div>
+        <details className="monitor-raw"><summary>查看底层阶段和模型调用明细（{item.events.length} 个事件，{item.modelCalls.length} 次请求）</summary>
+          <div className="table-wrap"><table><thead><tr><th>阶段</th><th>事件</th><th>耗时</th><th>说明</th></tr></thead><tbody>{item.events.map(event => <tr key={event.id}><td><span className="rule-chip">{event.stage}</span></td><td><Badge value={event.event_type} /></td><td>{ms(event.duration_ms)}</td><td className="text-cell">{event.message}</td></tr>)}</tbody></table></div>
+          {item.modelCalls.length > 0 && <div className="table-wrap monitor-call-table"><table><thead><tr><th>角色</th><th>模型</th><th>操作</th><th>耗时</th><th>输入</th><th>输出</th><th>缓存</th><th>状态</th></tr></thead><tbody>{item.modelCalls.map(call => <tr key={call.id}><td>{call.model_role || '-'}</td><td>{call.model_id || '-'}</td><td>{call.operation} #{call.attempt}</td><td>{ms(call.duration_ms)}</td><td>{call.input_tokens ?? '-'}</td><td>{call.output_tokens ?? '-'}</td><td>{call.cached_input_tokens ?? '-'}</td><td><Badge value={call.status} /></td></tr>)}</tbody></table></div>}
+        </details>
+      </div>
+    </details>)}</div> : <Empty title="等待第一条标注开始" />}
+  </div>
+}
+
 function CompareView({ value }: { value: { left: { run: Run; metrics: Metrics }; right: { run: Run; metrics: Metrics } } }) {
-  const rows: Array<[string, keyof Metrics]> = [['准确率', 'accuracy'], ['自动通过率', 'auto_accept_rate'], ['人工审核率', 'review_rate'], ['Rule 冲突率', 'rule_conflict_rate']]
-  return <div className="compare-grid" style={{ marginTop: 16 }}><div className="compare-head">指标</div><div className="compare-head">Standard v{value.left.run.standard_version}</div><div className="compare-head">Standard v{value.right.run.standard_version}</div>{rows.map(([label, key]) => <FragmentRow key={key} label={label} left={value.left.metrics[key] as number | null} right={value.right.metrics[key] as number | null} invert={key === 'review_rate' || key === 'rule_conflict_rate'} />)}</div>
+  const rows: Array<[string, keyof Metrics]> = [['准确率', 'accuracy'], ['自动通过率', 'auto_accept_rate'], ['人工审核率', 'review_rate']]
+  return <div className="compare-grid" style={{ marginTop: 16 }}><div className="compare-head">指标</div><div className="compare-head">Standard v{value.left.run.standard_version}</div><div className="compare-head">Standard v{value.right.run.standard_version}</div>{rows.map(([label, key]) => <FragmentRow key={key} label={label} left={value.left.metrics[key] as number | null} right={value.right.metrics[key] as number | null} invert={key === 'review_rate'} />)}</div>
 }
 function FragmentRow({ label, left, right, invert }: { label: string; left: number | null; right: number | null; invert: boolean }) {
   const improved = left != null && right != null && (invert ? right < left : right > left)
@@ -440,9 +608,21 @@ function GapsPage({ runs, standards, refresh, notify }: { runs: Run[]; standards
       notify(`Standard v${revised.standard.version} 已生成，受影响数据开始重跑`); setEditing(null); await refresh()
     } catch (error) { notify(error instanceof Error ? error.message : '修改失败', true) } finally { setBusy(false) }
   }
+  async function approveAndApply(item: Suggestion) {
+    const patch = item.patch
+    if (!patch) { notify('该建议没有可审批的 Rule Patch', true); return }
+    setBusy(true)
+    try {
+      await api.updateRulePatch(patch.id, 'approved')
+      const result = await api.applyRulePatch(patch.id)
+      notify(`Rule Patch 已批准，Standard v${String((result.standard as { version: number }).version)} 已生成并开始重跑`)
+      await refresh()
+      setSuggestions(await api.suggestions(runId || undefined))
+    } catch (error) { notify(error instanceof Error ? error.message : 'Rule Patch 应用失败', true) } finally { setBusy(false) }
+  }
   return <>
-    <PageHead title="规则改进" meta={`${suggestions.length} 条修改建议`}><select className="select" style={{ width: 260 }} value={runId} onChange={event => setRunId(event.target.value)}><option value="">选择已完成运行</option>{completed.map(run => <option key={run.id} value={run.id}>{run.dataset_name} · Standard v{run.standard_version}</option>)}</select><button className="btn primary" disabled={!runId || busy} onClick={() => void mine()}>{busy ? <Spinner /> : <Sparkles size={15} />}挖掘 Spec Gap</button></PageHead>
-    <div className="panel">{suggestions.length ? suggestions.map(item => <div className="suggestion" key={item.id}><div className="actions" style={{ justifyContent: 'space-between' }}><div><h3>{item.payload.title}</h3><div className="list-meta"><Badge value={item.status} />{item.payload.labels.map(label => <span key={label}>{label}</span>)}{item.payload.target_rule_id && <span className="rule-chip">{item.payload.target_rule_id}</span>}</div></div><button className="btn" onClick={() => openEdit(item)}>修改 Rule <ArrowRight size={14} /></button></div><p><b>问题：</b>{item.payload.problem}</p><p><b>建议：</b>{item.payload.proposed_change}</p><ul className="case-list">{item.payload.typical_cases.map(value => <li key={value}>{value}</li>)}</ul></div>) : <Empty icon={Lightbulb} title="暂无 Rule 修改建议" />}</div>
+    <PageHead title="规则进化" meta={`${suggestions.length} 条待审批建议`}><select className="select" style={{ width: 260 }} value={runId} onChange={event => setRunId(event.target.value)}><option value="">选择已完成运行</option>{completed.map(run => <option key={run.id} value={run.id}>{run.dataset_name} · Standard v{run.standard_version}</option>)}</select><button className="btn primary" disabled={!runId || busy} onClick={() => void mine()}>{busy ? <Spinner /> : <Sparkles size={15} />}基于人工反馈生成 Patch</button></PageHead>
+    <div className="panel">{suggestions.length ? suggestions.map(item => <div className="suggestion" key={item.id}><div className="actions" style={{ justifyContent: 'space-between' }}><div><h3>{item.payload.title}</h3><div className="list-meta"><Badge value={item.patch?.status || item.status} />{item.payload.labels.map(label => <span key={label}>{label}</span>)}{item.payload.target_rule_id && <span className="rule-chip">{item.payload.target_rule_id}</span>}</div></div>{item.patch?.status === 'proposed' && <button className="btn primary" disabled={busy} onClick={() => void approveAndApply(item)}>批准 Patch 并重跑 <ArrowRight size={14} /></button>}</div><p><b>问题：</b>{item.payload.problem}</p><p><b>建议：</b>{item.payload.proposed_change}</p><p className="muted">Patch 操作：{item.payload.operations?.length || 0} 个，必须人工批准后才会生成新 Standard。</p><ul className="case-list">{item.payload.typical_cases.map(value => <li key={value}>{value}</li>)}</ul></div>) : <Empty icon={Lightbulb} title="暂无 Rule Patch" />}</div>
     {editing && <Modal title={`修改 ${editing.payload.target_rule_id}`} onClose={() => !busy && setEditing(null)} footer={<><button className="btn" disabled={busy} onClick={() => setEditing(null)}>取消</button><button className="btn primary" disabled={busy || !reason.trim()} onClick={() => void reviseAndRerun()}>{busy ? <Spinner /> : <Play size={14} />}生成 v2 并重跑</button></>}><div className="notice">{editing.payload.proposed_change}</div><div className="field"><label>Rule JSON</label><textarea className="textarea json" value={ruleJson} onChange={event => setRuleJson(event.target.value)} /></div><div className="field"><label>修改原因</label><textarea className="textarea" value={reason} onChange={event => setReason(event.target.value)} /></div></Modal>}
   </>
 }
@@ -459,7 +639,7 @@ function SettingsPage({ health, refresh, notify }: { health: { api_key_configure
     <PageHead title="模型设置" meta="Qianfan ModelBuilder V2"><button className="btn" disabled={busy || !health?.api_key_configured} onClick={() => void loadModels()}>{busy ? <Spinner /> : <RefreshCw size={15} />}读取模型列表</button><button className="btn primary" disabled={busy || !settings} onClick={() => void save()}><Save size={15} />保存</button></PageHead>
     {!health?.api_key_configured && <div className="alert" style={{ marginBottom: 16 }}><AlertTriangle size={16} /><span>未检测到 QIANFAN_API_KEY。请在服务端环境变量中配置后重启 API。</span></div>}
     {settings && <div className="panel"><div className="panel-head"><h2>模块模型</h2><Badge value={health?.api_key_configured ? 'API KEY SET' : 'API KEY REQUIRED'} /></div><div className="panel-body stack"><datalist id="qianfan-models">{models.map(model => <option value={model} key={model} />)}</datalist><div className="two-col">
-      {([['compiler_model', '标准编译模型'], ['annotator_model', '标注模型'], ['verifier_model', '校验模型'], ['miner_model', 'Spec Gap 模型'], ['embedding_model', 'Embedding 模型']] as Array<[keyof ModelSettings, string]>).map(([key, label]) => <div className="field" key={key}><label>{label}</label><input className="input" list="qianfan-models" value={String(settings[key])} onChange={event => update(key, event.target.value)} /></div>)}
-    </div><div className="two-col"><div className="field"><label>AUTO_ACCEPT 置信度阈值</label><input className="input" type="number" min="0" max="1" step="0.01" value={settings.auto_accept_threshold} onChange={event => update('auto_accept_threshold', Number(event.target.value))} /></div><div className="field"><label>Spec Gap 最小重复数</label><input className="input" type="number" min="2" step="1" value={settings.spec_gap_min_cluster_size} onChange={event => update('spec_gap_min_cluster_size', Number(event.target.value))} /></div></div></div></div>}
+      {([['compiler_model', '标准编译模型'], ['annotator_model', '标注模型'], ['miner_model', '规则进化模型'], ['embedding_model', 'Embedding 模型']] as Array<[keyof ModelSettings, string]>).map(([key, label]) => <div className="field" key={key}><label>{label}</label><input className="input" list="qianfan-models" value={String(settings[key])} onChange={event => update(key, event.target.value)} /></div>)}
+    </div><div className="two-col"><div className="field"><label>AUTO_ACCEPT 置信度阈值</label><input className="input" type="number" min="0" max="1" step="0.01" value={settings.auto_accept_threshold} onChange={event => update('auto_accept_threshold', Number(event.target.value))} /></div><div className="field"><label>人工反馈最小聚类数</label><input className="input" type="number" min="2" step="1" value={settings.spec_gap_min_cluster_size} onChange={event => update('spec_gap_min_cluster_size', Number(event.target.value))} /></div></div></div></div>}
   </>
 }

@@ -152,6 +152,8 @@ class Store:
                     processed INTEGER NOT NULL DEFAULT 0,
                     scope_item_ids_json TEXT,
                     error TEXT,
+                    current_item_id TEXT,
+                    current_stage TEXT,
                     created_at TEXT NOT NULL,
                     completed_at TEXT
                 );
@@ -168,6 +170,7 @@ class Store:
                     confidence REAL NOT NULL,
                     route TEXT NOT NULL,
                     route_reasons_json TEXT NOT NULL,
+                    decision_json TEXT NOT NULL DEFAULT '{}',
                     disclosure_json TEXT NOT NULL,
                     verifier_json TEXT NOT NULL,
                     human_label TEXT,
@@ -179,6 +182,69 @@ class Store:
 
                 CREATE INDEX IF NOT EXISTS idx_annotations_run ON annotations(run_id);
                 CREATE INDEX IF NOT EXISTS idx_annotations_route ON annotations(route);
+
+                CREATE TABLE IF NOT EXISTS annotation_feedback (
+                    id TEXT PRIMARY KEY,
+                    annotation_id TEXT NOT NULL REFERENCES annotations(id) ON DELETE CASCADE,
+                    model_label TEXT NOT NULL,
+                    human_label TEXT NOT NULL,
+                    review_type TEXT NOT NULL CHECK(review_type IN ('confirm', 'override')),
+                    reason_code TEXT NOT NULL,
+                    note TEXT NOT NULL,
+                    evidence_snapshot_json TEXT NOT NULL,
+                    rule_feedback_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_annotation_feedback_annotation
+                ON annotation_feedback(annotation_id);
+
+                CREATE TABLE IF NOT EXISTS annotation_events (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES annotation_runs(id) ON DELETE CASCADE,
+                    item_id TEXT,
+                    sequence INTEGER NOT NULL,
+                    stage TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    duration_ms REAL,
+                    model_role TEXT,
+                    model_id TEXT,
+                    metadata_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(run_id, sequence)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_annotation_events_run
+                ON annotation_events(run_id, sequence);
+                CREATE INDEX IF NOT EXISTS idx_annotation_events_item
+                ON annotation_events(run_id, item_id, sequence);
+
+                CREATE TABLE IF NOT EXISTS model_calls (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT,
+                    item_id TEXT,
+                    stage TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    attempt INTEGER NOT NULL DEFAULT 1,
+                    model_role TEXT,
+                    model_id TEXT,
+                    duration_ms REAL NOT NULL,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    total_tokens INTEGER,
+                    cached_input_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    request_id TEXT,
+                    status TEXT NOT NULL,
+                    error TEXT,
+                    usage_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_model_calls_run
+                ON model_calls(run_id, created_at);
 
                 CREATE TABLE IF NOT EXISTS suggestions (
                     id TEXT PRIMARY KEY,
@@ -192,6 +258,21 @@ class Store:
 
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_suggestions_signature
                 ON suggestions(run_id, signature);
+
+                CREATE TABLE IF NOT EXISTS rule_patches (
+                    id TEXT PRIMARY KEY,
+                    standard_id TEXT NOT NULL REFERENCES standards(id),
+                    source_run_id TEXT REFERENCES annotation_runs(id),
+                    payload_json TEXT NOT NULL,
+                    related_feedback_ids_json TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('proposed', 'approved', 'rejected', 'applied')),
+                    applied_standard_id TEXT REFERENCES standards(id),
+                    created_at TEXT NOT NULL,
+                    reviewed_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_rule_patches_standard
+                ON rule_patches(standard_id, status);
 
                 CREATE TABLE IF NOT EXISTS case_embeddings (
                     item_id TEXT NOT NULL REFERENCES data_items(id) ON DELETE CASCADE,
@@ -211,6 +292,14 @@ class Store:
             source_columns = {row["name"] for row in db.execute("PRAGMA table_info(standard_version_sources)")}
             if "role" not in source_columns:
                 db.execute("ALTER TABLE standard_version_sources ADD COLUMN role TEXT NOT NULL DEFAULT 'auto'")
+            run_columns = {row["name"] for row in db.execute("PRAGMA table_info(annotation_runs)")}
+            if "current_item_id" not in run_columns:
+                db.execute("ALTER TABLE annotation_runs ADD COLUMN current_item_id TEXT")
+            if "current_stage" not in run_columns:
+                db.execute("ALTER TABLE annotation_runs ADD COLUMN current_stage TEXT")
+            annotation_columns = {row["name"] for row in db.execute("PRAGMA table_info(annotations)")}
+            if "decision_json" not in annotation_columns:
+                db.execute("ALTER TABLE annotations ADD COLUMN decision_json TEXT NOT NULL DEFAULT '{}'")
 
             for row in db.execute("SELECT DISTINCT name FROM standards WHERE family_id IS NULL"):
                 family_id = str(uuid.uuid4())
@@ -691,8 +780,8 @@ class Store:
             db.execute(
                 """INSERT INTO annotation_runs
                    (id, dataset_id, standard_id, parent_run_id, status, total, processed,
-                    scope_item_ids_json, created_at)
-                   VALUES (?, ?, ?, ?, 'queued', ?, 0, ?, ?)""",
+                   scope_item_ids_json, current_item_id, current_stage, created_at)
+                   VALUES (?, ?, ?, ?, 'queued', ?, 0, ?, NULL, NULL, ?)""",
                 (run_id, dataset_id, standard_id, parent_run_id, total, _json(scope_item_ids) if scope_item_ids is not None else None, utc_now()),
             )
         return self.get_run(run_id)
@@ -725,13 +814,117 @@ class Store:
         return [{**dict(row), "scope_item_ids": _loads(row["scope_item_ids_json"])} for row in rows]
 
     def update_run(self, run_id: str, **fields: Any) -> None:
-        allowed = {"status", "processed", "error", "completed_at"}
+        allowed = {
+            "status", "processed", "error", "completed_at",
+            "current_item_id", "current_stage",
+        }
         data = {key: value for key, value in fields.items() if key in allowed}
         if not data:
             return
         assignments = ", ".join(f"{key} = ?" for key in data)
         with self.connect() as db:
             db.execute(f"UPDATE annotation_runs SET {assignments} WHERE id = ?", [*data.values(), run_id])
+
+    def save_annotation_event(
+        self,
+        run_id: str,
+        item_id: Optional[str],
+        stage: str,
+        event_type: str,
+        status: str,
+        message: str,
+        duration_ms: Optional[float] = None,
+        model_role: Optional[str] = None,
+        model_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        event_id = str(uuid.uuid4())
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM annotation_events WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            sequence = int(row["sequence"]) + 1
+            created_at = utc_now()
+            db.execute(
+                """INSERT INTO annotation_events
+                   (id, run_id, item_id, sequence, stage, event_type, status, message,
+                    duration_ms, model_role, model_id, metadata_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event_id, run_id, item_id, sequence, stage, event_type, status,
+                    message, duration_ms, model_role, model_id, _json(metadata or {}), created_at,
+                ),
+            )
+        return {
+            "id": event_id,
+            "run_id": run_id,
+            "item_id": item_id,
+            "sequence": sequence,
+            "stage": stage,
+            "event_type": event_type,
+            "status": status,
+            "message": message,
+            "duration_ms": duration_ms,
+            "model_role": model_role,
+            "model_id": model_id,
+            "metadata": metadata or {},
+            "created_at": created_at,
+        }
+
+    def list_annotation_events(self, run_id: str, after: int = 0) -> List[Dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT * FROM annotation_events
+                   WHERE run_id = ? AND sequence > ? ORDER BY sequence""",
+                (run_id, after),
+            ).fetchall()
+        return [
+            {
+                **dict(row),
+                "metadata": _loads(row["metadata_json"], {}),
+            }
+            for row in rows
+        ]
+
+    def save_model_call(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        call_id = record.get("id") or str(uuid.uuid4())
+        created_at = record.get("created_at") or utc_now()
+        with self.connect() as db:
+            db.execute(
+                """INSERT INTO model_calls
+                   (id, run_id, item_id, stage, operation, attempt, model_role, model_id,
+                    duration_ms, input_tokens, output_tokens, total_tokens,
+                    cached_input_tokens, reasoning_tokens, request_id, status, error,
+                    usage_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    call_id, record.get("run_id"), record.get("item_id"),
+                    record.get("stage", "UNKNOWN"), record.get("operation", "chat"),
+                    record.get("attempt", 1), record.get("model_role"), record.get("model_id"),
+                    record.get("duration_ms", 0), record.get("input_tokens"),
+                    record.get("output_tokens"), record.get("total_tokens"),
+                    record.get("cached_input_tokens"), record.get("reasoning_tokens"),
+                    record.get("request_id"), record.get("status", "success"),
+                    record.get("error"), _json(record.get("usage", {})), created_at,
+                ),
+            )
+        return {**record, "id": call_id, "created_at": created_at}
+
+    def list_model_calls(self, run_id: str, item_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM model_calls WHERE run_id = ?"
+        params: List[Any] = [run_id]
+        if item_id:
+            sql += " AND item_id = ?"
+            params.append(item_id)
+        sql += " ORDER BY created_at, id"
+        with self.connect() as db:
+            rows = db.execute(sql, params).fetchall()
+        return [
+            {**dict(row), "usage": _loads(row["usage_json"], {})}
+            for row in rows
+        ]
 
     def save_annotation(self, run_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
         annotation_id = str(uuid.uuid4())
@@ -740,8 +933,8 @@ class Store:
                 """INSERT OR REPLACE INTO annotations
                    (id, run_id, item_id, label, candidates_json, rules_used_json,
                     rule_reasons_json, evidence, confidence, route, route_reasons_json,
-                    disclosure_json, verifier_json, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    decision_json, disclosure_json, verifier_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     annotation_id,
                     run_id,
@@ -754,6 +947,7 @@ class Store:
                     result.get("confidence", 0),
                     result["route"],
                     _json(result.get("route_reasons", [])),
+                    _json(result.get("decision", {})),
                     _json(result.get("disclosure", {})),
                     _json(result.get("verifier", {})),
                     utc_now(),
@@ -786,17 +980,209 @@ class Store:
 
     def _annotation_row(self, row: sqlite3.Row) -> Dict[str, Any]:
         result = dict(row)
-        for column in ("candidates_json", "rules_used_json", "rule_reasons_json", "route_reasons_json", "disclosure_json", "verifier_json"):
+        for column in ("candidates_json", "rules_used_json", "rule_reasons_json", "route_reasons_json", "decision_json", "disclosure_json", "verifier_json"):
             result[column[:-5]] = _loads(row[column], [] if column.endswith("s_json") else {})
+        result["route_reasons"] = self._normalize_route_reasons(result.get("route_reasons", []))
+        result["verifier"] = self._normalize_verifier(result.get("verifier", {}))
+        if not result.get("decision"):
+            result["decision"] = self._legacy_decision(result)
         return result
 
-    def review_annotation(self, annotation_id: str, human_label: str, note: str) -> Dict[str, Any]:
+    @staticmethod
+    def _normalize_route_reasons(value: Any) -> List[Dict[str, str]]:
+        if not isinstance(value, list):
+            return []
+        normalized: List[Dict[str, str]] = []
+        for item in value:
+            if isinstance(item, dict):
+                normalized.append(item)
+            else:
+                normalized.append({"code": "LEGACY", "source": "ROUTER", "message": str(item)})
+        return normalized
+
+    @staticmethod
+    def _normalize_verifier(value: Any) -> Dict[str, Any]:
+        if not isinstance(value, dict):
+            return {"outcome": "SKIPPED", "issues": [], "summary": "未记录独立核验结果"}
+        if "outcome" in value:
+            return value
+        verdict = value.get("verdict", "UNCERTAIN")
+        if verdict == "PASS":
+            return {"outcome": "PASS", "issues": [], "summary": value.get("explanation", "历史核验通过")}
+        return {
+            "outcome": "REVIEW",
+            "issues": [{"code": "OTHER", "severity": "BLOCKING", "message": value.get("explanation", "历史 Verifier 未通过")}],
+            "summary": value.get("explanation", "历史 Verifier 未通过"),
+        }
+
+    @staticmethod
+    def _legacy_decision(result: Dict[str, Any]) -> Dict[str, Any]:
+        route = result.get("route")
+        status = {
+            "AMBIGUOUS": "AMBIGUOUS",
+            "SPEC_GAP": "SPEC_GAP",
+        }.get(route, "LABELED" if result.get("label") else "SPEC_GAP")
+        rules = result.get("rules_used") or []
+        reasons = result.get("route_reasons") or []
+        first_reason = reasons[0] if reasons else None
+        if isinstance(first_reason, dict):
+            first_reason = first_reason.get("message")
+        return {
+            "status": status,
+            "label": result.get("label"),
+            "leaf_rule_used": rules[0] if status == "LABELED" and rules else None,
+            "decision_rules_referenced": rules[1:] if status == "LABELED" else [],
+            "rule_reasons": result.get("rule_reasons", {}),
+            "evidence": result.get("evidence", "历史记录未保存结构化证据") or "历史记录未保存结构化证据",
+            "reason": result.get("evidence") or first_reason or "历史记录未保存决策理由",
+            "confidence": result.get("confidence", 0),
+        }
+
+    def review_annotation(
+        self,
+        annotation_id: str,
+        human_label: str,
+        note: str,
+        reason_code: str = "MANUAL_REVIEW",
+        rule_feedback: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        annotation = self.get_annotation(annotation_id)
+        run = self.get_run(annotation["run_id"])
+        standard = parse_compiled_standard(self.get_standard(run["standard_id"])["compiled"])
+        valid_labels = {
+            label_path(standard, label_id)
+            for label_id in leaf_ids(standard)
+        }
+        if human_label not in valid_labels:
+            raise ValueError(f"人工标签必须是当前 Standard 的合法叶子标签: {human_label}")
+        model_label = annotation.get("label") or ""
+        review_type = "confirm" if model_label == human_label else "override"
+        feedback_id = str(uuid.uuid4())
+        evidence_snapshot = {
+            "text": annotation.get("text", ""),
+            "model_label": model_label,
+            "route": annotation.get("route"),
+            "evidence": annotation.get("evidence", ""),
+            "decision": annotation.get("decision", {}),
+            "disclosure": annotation.get("disclosure", {}),
+        }
         with self.connect() as db:
             db.execute(
                 "UPDATE annotations SET human_label = ?, review_note = ?, reviewed_at = ? WHERE id = ?",
                 (human_label, note, utc_now(), annotation_id),
             )
-        return self.get_annotation(annotation_id)
+            db.execute(
+                """INSERT INTO annotation_feedback
+                   (id, annotation_id, model_label, human_label, review_type,
+                    reason_code, note, evidence_snapshot_json, rule_feedback_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    feedback_id, annotation_id, model_label, human_label, review_type,
+                    reason_code.strip() or "MANUAL_REVIEW", note.strip(),
+                    _json(evidence_snapshot), _json(rule_feedback or []), utc_now(),
+                ),
+            )
+        result = self.get_annotation(annotation_id)
+        result["feedback_id"] = feedback_id
+        return result
+
+    def list_feedback(
+        self,
+        run_id: Optional[str] = None,
+        standard_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        sql = """SELECT f.*, a.run_id, a.item_id, i.text
+                 FROM annotation_feedback f
+                 JOIN annotations a ON a.id = f.annotation_id
+                 JOIN data_items i ON i.id = a.item_id"""
+        clauses: List[str] = []
+        params: List[Any] = []
+        if run_id:
+            clauses.append("a.run_id = ?")
+            params.append(run_id)
+        if standard_id:
+            sql += " JOIN annotation_runs r ON r.id = a.run_id"
+            clauses.append("r.standard_id = ?")
+            params.append(standard_id)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY f.created_at"
+        with self.connect() as db:
+            rows = db.execute(sql, params).fetchall()
+        return [
+            {
+                **dict(row),
+                "evidence_snapshot": _loads(row["evidence_snapshot_json"], {}),
+                "rule_feedback": _loads(row["rule_feedback_json"], []),
+            }
+            for row in rows
+        ]
+
+    def save_rule_patch(
+        self,
+        standard_id: str,
+        payload: Dict[str, Any],
+        related_feedback_ids: List[str],
+        source_run_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        patch_id = str(uuid.uuid4())
+        with self.connect() as db:
+            db.execute(
+                """INSERT INTO rule_patches
+                   (id, standard_id, source_run_id, payload_json,
+                    related_feedback_ids_json, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, 'proposed', ?)""",
+                (
+                    patch_id, standard_id, source_run_id, _json(payload),
+                    _json(related_feedback_ids), utc_now(),
+                ),
+            )
+        return self.get_rule_patch(patch_id)
+
+    def get_rule_patch(self, patch_id: str) -> Dict[str, Any]:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM rule_patches WHERE id = ?", (patch_id,)).fetchone()
+        if not row:
+            raise KeyError(f"Rule Patch {patch_id} 不存在")
+        return {
+            **dict(row),
+            "payload": _loads(row["payload_json"], {}),
+            "related_feedback_ids": _loads(row["related_feedback_ids_json"], []),
+        }
+
+    def list_rule_patches(
+        self, standard_id: Optional[str] = None, status: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        sql = "SELECT id FROM rule_patches"
+        clauses: List[str] = []
+        params: List[Any] = []
+        if standard_id:
+            clauses.append("standard_id = ?")
+            params.append(standard_id)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC"
+        with self.connect() as db:
+            rows = db.execute(sql, params).fetchall()
+        return [self.get_rule_patch(row["id"]) for row in rows]
+
+    def update_rule_patch_status(
+        self, patch_id: str, status: str, applied_standard_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        if status not in {"proposed", "approved", "rejected", "applied"}:
+            raise ValueError("Rule Patch 状态必须是 proposed、approved、rejected 或 applied")
+        with self.connect() as db:
+            row = db.execute("SELECT id FROM rule_patches WHERE id = ?", (patch_id,)).fetchone()
+            if not row:
+                raise KeyError(f"Rule Patch {patch_id} 不存在")
+            db.execute(
+                "UPDATE rule_patches SET status = ?, applied_standard_id = ?, reviewed_at = ? WHERE id = ?",
+                (status, applied_standard_id, utc_now(), patch_id),
+            )
+        return self.get_rule_patch(patch_id)
 
     def historical_cases(self, exclude_item_id: str, limit: int = 100) -> List[Dict[str, Any]]:
         with self.connect() as db:
@@ -853,6 +1239,12 @@ class Store:
         result = dict(row)
         result["payload"] = _loads(row["payload_json"], {})
         result["case_ids"] = _loads(row["case_ids_json"], [])
+        patch_id = result["payload"].get("patch_id")
+        if patch_id:
+            try:
+                result["patch"] = self.get_rule_patch(patch_id)
+            except KeyError:
+                pass
         return result
 
     def list_suggestions(self, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -864,10 +1256,7 @@ class Store:
         sql += " ORDER BY created_at DESC"
         with self.connect() as db:
             rows = db.execute(sql, params).fetchall()
-        return [
-            {**dict(row), "payload": _loads(row["payload_json"], {}), "case_ids": _loads(row["case_ids_json"], [])}
-            for row in rows
-        ]
+        return [self.get_suggestion(row["id"]) for row in rows]
 
     def update_suggestion_status(self, suggestion_id: str, status: str) -> Dict[str, Any]:
         if status not in {"open", "accepted", "dismissed"}:

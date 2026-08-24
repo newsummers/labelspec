@@ -59,6 +59,9 @@ export const api = {
   review: (id: string, human_label: string, note: string) => request(`/api/annotations/${id}/review`, { method: 'POST', body: JSON.stringify({ human_label, note }) }),
   mine: (id: string) => request<{ suggestions: Suggestion[] }>(`/api/runs/${id}/mine`, { method: 'POST' }),
   suggestions: (runId?: string) => request<Suggestion[]>(`/api/suggestions${runId ? `?run_id=${runId}` : ''}`),
+  rulePatches: (standardId?: string) => request<Array<Record<string, unknown>>>(`/api/rule-patches${standardId ? `?standard_id=${standardId}` : ''}`),
+  updateRulePatch: (id: string, status: string) => request<Record<string, unknown>>(`/api/rule-patches/${id}?status=${encodeURIComponent(status)}`, { method: 'PATCH' }),
+  applyRulePatch: (id: string) => request<Record<string, unknown>>(`/api/rule-patches/${id}/apply`, { method: 'POST' }),
   impactRun: (payload: unknown) => request<Run>('/api/impact-runs', { method: 'POST', body: JSON.stringify(payload) }),
   compare: (left: string, right: string) => request<{ left: { run: Run; metrics: import('./types').Metrics }; right: { run: Run; metrics: import('./types').Metrics } }>(`/api/compare?left_run_id=${left}&right_run_id=${right}`),
 }
