@@ -222,6 +222,14 @@ tbody tr:hover { background: #fafbfa; }
 .candidate-chain-rules { display: grid; gap: 5px; margin-top: 8px; padding-left: 8px; border-left: 2px solid #dce8e0; }
 .candidate-chain-rule { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; color: #46504a; line-height: 1.55; }
 .candidate-level { color: var(--muted); font-size: 10px; white-space: nowrap; }
+.reason-with-keys { display: grid; gap: 7px; }
+.reason-keys { display: flex; flex-wrap: wrap; gap: 5px; }
+.reason-key { background: var(--primary-soft); color: var(--primary-dark); font-weight: 700; }
+.label-picker { display: grid; gap: 8px; }
+.label-picker-levels { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+.label-picker-level { min-width: 0; }
+.label-picker-value { color: var(--primary-dark); font-weight: 650; }
+.label-picker-empty { min-height: 38px; display: flex; align-items: center; padding: 0 10px; border: 1px solid #e0c9a1; background: #fffbef; color: var(--amber); font-size: 12px; }
 .suggestion { padding: 16px; border-bottom: 1px solid var(--soft-line); }
 .suggestion:last-child { border-bottom: 0; }
 .suggestion h3 { margin: 0; font-size: 14px; }

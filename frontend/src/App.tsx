@@ -30,6 +30,72 @@ function date(value?: string) {
 function pct(value?: number | null) { return value == null ? '-' : `${(value * 100).toFixed(1)}%` }
 function ms(value?: number | null) { return value == null ? '-' : value < 1000 ? `${Math.round(value)} ms` : `${(value / 1000).toFixed(1)} s` }
 function Badge({ value, className = '' }: { value: string; className?: string }) { return <span className={`badge ${value} ${className}`.trim()}>{value}</span> }
+const routeReasonLabels: Record<string, string> = {
+  AMBIGUOUS: '意图模糊',
+  'AMBIGUOUS FUTURE EVENT': '未来事件意图模糊',
+  SPEC_GAP: '标准覆盖不足',
+  NEEDS_CONTEXT: '需要上下文',
+  LOW_CONFIDENCE: '置信度低',
+  INVALID_ANNOTATOR_OUTPUT: '标注模型输出无效',
+  INVALID_RULE_REFERENCE: '引用了无效规则',
+  INVALID_LABEL: '标签无效',
+  ANNOTATOR_REVIEW: '需要人工审核',
+  MANUAL_REVIEW: '人工审核',
+  AUTO_ACCEPT: '自动通过',
+  OTHER: '其他原因',
+}
+const routeReasonWords: Record<string, string> = {
+  ambiguous: '意图模糊',
+  ambiguity: '存在歧义',
+  future: '未来',
+  event: '事件',
+  events: '事件',
+  intent: '意图',
+  candidate: '候选',
+  candidates: '候选',
+  overlap: '交叉',
+  overlapping: '交叉',
+  conflict: '冲突',
+  conflicts: '冲突',
+  context: '上下文',
+  confidence: '置信度',
+  low: '低',
+  high: '高',
+  insufficient: '不足',
+  unclear: '不明确',
+  invalid: '无效',
+  unsupported: '不支持',
+  missing: '缺失',
+  annotator: '标注模型',
+  output: '输出',
+  rule: '规则',
+  rules: '规则',
+  reference: '引用',
+  label: '标签',
+  labels: '标签',
+  manual: '人工',
+  review: '审核',
+  needs: '需要',
+  require: '需要',
+  required: '必需',
+  specification: '标准',
+  spec: '标准',
+  gap: '缺口',
+  auto: '自动',
+  accept: '通过',
+}
+function routeReasonKey(reason: Annotation['route_reasons'][number]) {
+  const code = (reason.code || reason.message).trim()
+  const normalized = code.replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').toUpperCase()
+  const label = routeReasonLabels[code] || routeReasonLabels[normalized] || localizeRouteReason(code)
+  return `${reason.source}_${label}`
+}
+function localizeRouteReason(value: string) {
+  if (/[\u4e00-\u9fff]/.test(value) && !/[a-z]/i.test(value)) return value
+  const words = value.toLowerCase().replace(/[-_]+/g, ' ').split(/\s+/).filter(Boolean)
+  const translated = words.map(word => /[\u4e00-\u9fff]/.test(word) ? word : routeReasonWords[word]).filter(Boolean)
+  return translated.length ? translated.join('') : '其他原因'
+}
 function Spinner() { return <span className="spinner" /> }
 function Empty({ icon: Icon = Layers3, title, text }: { icon?: typeof Layers3; title: string; text?: string }) {
   return <div className="empty"><div><Icon size={24} /><div className="empty-title">{title}</div>{text && <div className="empty-text">{text}</div>}</div></div>
@@ -87,8 +153,8 @@ export default function App() {
           {page === 'dashboard' && <Dashboard standards={standards} datasets={datasets} runs={runs} setPage={setPage} />}
           {page === 'standards' && <StandardsPage standards={standards} refresh={refresh} notify={notify} />}
           {page === 'datasets' && <DatasetsPage datasets={datasets} standards={standards} refresh={refresh} notify={notify} setPage={setPage} />}
-          {page === 'runs' && <RunsPage runs={runs} refresh={refresh} notify={notify} />}
-          {page === 'gaps' && <GapsPage runs={runs} standards={standards} refresh={refresh} notify={notify} />}
+          {page === 'runs' && <RunsPage runs={runs} standards={standards} refresh={refresh} notify={notify} />}
+          {page === 'gaps' && <GapsPage runs={runs} refresh={refresh} notify={notify} />}
           {page === 'settings' && <SettingsPage health={health} refresh={refresh} notify={notify} />}
         </>}
       </section>
@@ -461,7 +527,7 @@ function tokenText(tokens: TokenSummary) { return `输入 ${tokens.input.toLocal
 function costText(value: number) { return `¥${value.toFixed(4)}` }
 function modelSummaryText(summary: ModelSummary) { return `${summary.calls} 次 · ${ms(summary.duration)} · ${tokenText(summary)} · ${costText(summary.cost)}` }
 
-function RunsPage({ runs, refresh, notify }: { runs: Run[]; refresh: () => Promise<void>; notify: (text: string, error?: boolean) => void }) {
+function RunsPage({ runs, standards, refresh, notify }: { runs: Run[]; standards: StandardSummary[]; refresh: () => Promise<void>; notify: (text: string, error?: boolean) => void }) {
   const [selectedId, setSelectedId] = useState(runs[0]?.id || '')
   const [detail, setDetail] = useState<RunDetail | null>(null)
   const [items, setItems] = useState<Array<{ id: string; text: string }>>([])
@@ -527,6 +593,7 @@ function RunsPage({ runs, refresh, notify }: { runs: Run[]; refresh: () => Promi
   const runDuration = monitors.reduce((sum, item) => sum + (item.duration || 0), 0)
   const annotationCallSummary = annotation ? aggregateCalls((detail?.model_calls || []).filter(call => call.item_id === annotation.item_id)) : null
   const candidatePaths = annotation?.disclosure.candidates || annotation?.disclosure.definitions.map(item => item.leaf_path) || []
+  const reviewStandard = detail ? standards.find(item => item.id === detail.run.standard_id) : undefined
   return <>
     <PageHead title="标注运行" meta={`${runs.length} 次运行`}><select className="select run-selector" aria-label="选择标注运行" title="选择标注运行" value={selectedId} onChange={event => setSelectedId(event.target.value)} disabled={!runs.length}><option value="">选择运行</option>{runs.map(run => <option key={run.id} value={run.id}>{run.dataset_name} · v{run.standard_version} · {run.status}</option>)}</select>{detail?.run.status === 'completed' && <><a className="btn" href={`/api/runs/${detail.run.id}/export?format=csv`}><Upload size={15} style={{ transform: 'rotate(180deg)' }} />导出结果</a><a className="btn" href={`/api/runs/${detail.run.id}/export?format=jsonl&gold_only=true`}><ShieldCheck size={15} />导出 Gold</a></>}{detail?.run.status === 'failed' && <button className="btn primary" disabled={retrying} onClick={() => void retry()}>{retrying ? <Spinner /> : <Play size={15} />}继续运行</button>}<button className="btn" onClick={() => void refresh()}><RefreshCw size={15} />刷新</button></PageHead>
     <div className="run-detail-layout">{detail ? <>
@@ -536,11 +603,73 @@ function RunsPage({ runs, refresh, notify }: { runs: Run[]; refresh: () => Promi
       </> : <Empty title="选择一次运行" />}
     </div>
     {runs.filter(item => item.status === 'completed').length >= 2 && <div className="panel" style={{ marginTop: 16 }}><div className="panel-head"><h2>版本对比</h2><GitCompareArrows size={16} /></div><div className="panel-body"><div className="field-row" style={{ gridTemplateColumns: '1fr 1fr auto' }}><select className="select" value={compareIds[0]} onChange={event => setCompareIds([event.target.value, compareIds[1]])}><option value="">基准运行</option>{runs.filter(item => item.status === 'completed').map(item => <option key={item.id} value={item.id}>{item.dataset_name} · v{item.standard_version}</option>)}</select><select className="select" value={compareIds[1]} onChange={event => setCompareIds([compareIds[0], event.target.value])}><option value="">对比运行</option>{runs.filter(item => item.status === 'completed').map(item => <option key={item.id} value={item.id}>{item.dataset_name} · v{item.standard_version}</option>)}</select><button className="btn" onClick={() => void compare()} disabled={!compareIds[0] || !compareIds[1]}>对比</button></div>{comparison && <CompareView value={comparison} />}</div></div>}
-    {annotation && <Modal title="标注详情" wide onClose={() => setAnnotation(null)} footer={<><button className="btn" onClick={() => setAnnotation(null)}>关闭</button><button className="btn primary" disabled={!reviewLabel} onClick={() => void review()}><Save size={14} />保存审核</button></>}>
-      <dl className="detail-grid"><dt>文本</dt><dd>{annotation.text}</dd><dt>建议 Label</dt><dd>{annotation.label || '-'}</dd><dt>路由</dt><dd><Badge value={annotation.route} /></dd><dt>判断理由</dt><dd>{annotation.decision.reason}</dd><dt>原文证据</dt><dd>{annotation.evidence}</dd><dt>候选召回</dt><dd><div className="candidate-chain-list">{candidatePaths.length ? candidatePaths.map((candidate, candidateIndex) => { const definition = annotation.disclosure.definitions.find(item => item.leaf_path === candidate); const selected = candidate === annotation.label; return <div className={`candidate-chain ${selected ? 'selected' : ''}`} key={candidate}><div className="candidate-chain-head"><span className="candidate-index">候选 {candidateIndex + 1}</span><strong>{candidate}</strong>{selected && <span className="candidate-selected">当前建议</span>}</div>{definition?.chain.length ? <div className="candidate-chain-rules">{definition.chain.map((rule, index) => <div className="candidate-chain-rule" key={rule.rule_id}><span className="rule-chip">{rule.rule_id}</span><span className="candidate-level">{index === definition.chain.length - 1 ? '叶子定义' : `第 ${index + 1} 层`}</span><span>{rule.definition}</span></div>)}</div> : <div className="muted">未记录该候选的层级 Definition</div>}</div> }) : <span className="muted">没有记录候选召回结果</span>}</div></dd><dt>规则证据</dt><dd>{annotation.decision.evidence_items?.length ? <div className="stack" style={{ gap: 6 }}>{annotation.decision.evidence_items.map((item, index) => <div key={index}>{String(item.rule_id || item.type || 'evidence')}：{String(item.explanation || item.quote || item.rule_text || '')}</div>)}</div> : '暂无结构化规则证据'}</dd><dt>路由原因</dt><dd><div className="stack" style={{ gap: 6 }}>{annotation.route_reasons.map((reason, index) => <div key={`${reason.code}-${index}`}><span className="rule-chip">{reason.source}</span><span className="rule-chip">{reason.code}</span> {reason.message}</div>)}</div></dd><dt>模型汇总</dt><dd>{annotationCallSummary && <div className="stack" style={{ gap: 5 }}><div>Annotator：{modelSummaryText(annotationCallSummary.annotator)}</div><div>总计：{tokenText(annotationCallSummary.total)} · {costText(annotationCallSummary.total.cost)}</div></div>}</dd><dt>Rules Used</dt><dd><div className="rules">{annotation.rules_used.map(rule => <span className="rule-chip" key={rule}>{rule}</span>)}</div></dd></dl>
-      <div className="field"><label>人工 Label</label><input className="input" value={reviewLabel} onChange={event => setReviewLabel(event.target.value)} /></div><div className="field"><label>审核备注</label><textarea className="textarea" value={reviewNote} onChange={event => setReviewNote(event.target.value)} /></div>
+    {annotation && <Modal title="标注详情" wide onClose={() => setAnnotation(null)} footer={<><button className="btn" onClick={() => setAnnotation(null)}>关闭</button><button className="btn primary" disabled={!reviewLabel || !reviewStandard} onClick={() => void review()}><Save size={14} />保存审核</button></>}>
+      <dl className="detail-grid"><dt>文本</dt><dd>{annotation.text}</dd><dt>建议 Label</dt><dd>{annotation.label || '-'}</dd><dt>路由</dt><dd><Badge value={annotation.route} /></dd><dt>判断理由</dt><dd><div className="reason-with-keys">{annotation.route_reasons.length > 0 && <div className="reason-keys">{annotation.route_reasons.map((reason, index) => <span className="rule-chip reason-key" key={`${reason.source}-${reason.code}-${index}`}>{routeReasonKey(reason)}</span>)}</div>}<div>{annotation.decision.reason}</div></div></dd><dt>原文证据</dt><dd>{annotation.evidence}</dd><dt>候选召回</dt><dd><div className="candidate-chain-list">{candidatePaths.length ? candidatePaths.map((candidate, candidateIndex) => { const definition = annotation.disclosure.definitions.find(item => item.leaf_path === candidate); const selected = candidate === annotation.label; return <div className={`candidate-chain ${selected ? 'selected' : ''}`} key={candidate}><div className="candidate-chain-head"><span className="candidate-index">候选 {candidateIndex + 1}</span><strong>{candidate}</strong>{selected && <span className="candidate-selected">当前建议</span>}</div>{definition?.chain.length ? <div className="candidate-chain-rules">{definition.chain.map((rule, index) => <div className="candidate-chain-rule" key={rule.rule_id}><span className="rule-chip">{rule.rule_id}</span><span className="candidate-level">{index === definition.chain.length - 1 ? '叶子定义' : `第 ${index + 1} 层`}</span><span>{rule.definition}</span></div>)}</div> : <div className="muted">未记录该候选的层级 Definition</div>}</div> }) : <span className="muted">没有记录候选召回结果</span>}</div></dd><dt>规则证据</dt><dd>{annotation.decision.evidence_items?.length ? <div className="stack" style={{ gap: 6 }}>{annotation.decision.evidence_items.map((item, index) => <div key={index}>{String(item.rule_id || item.type || 'evidence')}：{String(item.explanation || item.quote || item.rule_text || '')}</div>)}</div> : '暂无结构化规则证据'}</dd><dt>模型汇总</dt><dd>{annotationCallSummary && <div className="stack" style={{ gap: 5 }}><div>Annotator：{modelSummaryText(annotationCallSummary.annotator)}</div><div>总计：{tokenText(annotationCallSummary.total)} · {costText(annotationCallSummary.total.cost)}</div></div>}</dd><dt>Rules Used</dt><dd><div className="rules">{annotation.rules_used.map(rule => <span className="rule-chip" key={rule}>{rule}</span>)}</div></dd></dl>
+      <HierarchicalLabelPicker standard={reviewStandard} value={reviewLabel} onChange={setReviewLabel} />
+      <div className="field"><label>审核备注</label><textarea className="textarea" value={reviewNote} onChange={event => setReviewNote(event.target.value)} /></div>
     </Modal>}
   </>
+}
+
+function HierarchicalLabelPicker({ standard, value, onChange }: { standard?: StandardSummary; value: string; onChange: (value: string) => void }) {
+  const labels = useMemo(() => standard?.compiled.labels.labels || [], [standard])
+  const children = useMemo(() => {
+    const grouped = new Map<string, typeof labels>()
+    labels.forEach(label => {
+      const parent = label.parent_id || ''
+      const siblings = grouped.get(parent) || []
+      siblings.push(label)
+      grouped.set(parent, siblings)
+    })
+    grouped.forEach(siblings => siblings.sort((left, right) => left.name.localeCompare(right.name, 'zh-CN')))
+    return grouped
+  }, [labels])
+  const idByPath = useMemo(() => new Map(labels.map(label => [nodePath(standard!.compiled, label.label_id), label.label_id])), [labels, standard])
+  const [selectedIds, setSelectedIds] = useState<string[]>([])
+
+  useEffect(() => {
+    if (!standard) {
+      setSelectedIds([])
+      return
+    }
+    if (!value) return
+    const selectedId = idByPath.get(value)
+    if (!selectedId) {
+      setSelectedIds([])
+      return
+    }
+    const byId = new Map(labels.map(label => [label.label_id, label]))
+    const chain: string[] = []
+    let current = byId.get(selectedId)
+    while (current) {
+      chain.unshift(current.label_id)
+      current = current.parent_id ? byId.get(current.parent_id) : undefined
+    }
+    setSelectedIds(chain)
+  }, [idByPath, labels, standard, value])
+
+  function choose(level: number, labelId: string) {
+    const next = [...selectedIds.slice(0, level), labelId]
+    setSelectedIds(next)
+    const selected = labels.find(label => label.label_id === labelId)
+    const hasChildren = Boolean(selected && children.get(selected.label_id)?.length)
+    onChange(!hasChildren && selected ? nodePath(standard!.compiled, selected.label_id) : '')
+  }
+
+  if (!standard) {
+    return <div className="field"><label>人工 Label</label><div className="label-picker-empty">当前运行对应的 Standard 尚未加载，暂不能选择标签</div></div>
+  }
+  const levels: ReactNode[] = []
+  let parentId = ''
+  for (let level = 0; ; level += 1) {
+    const options = children.get(parentId) || []
+    if (!options.length) break
+    const selectedAtLevel = selectedIds[level] || ''
+    levels.push(<div className="field label-picker-level" key={parentId || 'root'}><label>{level === 0 ? '人工 Label' : `第 ${level + 1} 层`}</label><select className="select" value={selectedAtLevel} onChange={event => choose(level, event.target.value)}><option value="">选择{level === 0 ? '标签' : '下级标签'}</option>{options.map(label => <option value={label.label_id} key={label.label_id}>{label.name}{children.get(label.label_id)?.length ? '' : ' · 叶子'}</option>)}</select></div>)
+    if (!selectedAtLevel) break
+    parentId = selectedAtLevel
+  }
+  return <div className="label-picker"><div className="label-picker-levels">{levels}</div><div className={`hint ${value ? 'label-picker-value' : ''}`}>{value ? `已选叶子标签：${value}` : '请按层级选择，只有叶子标签可以保存审核'}</div></div>
 }
 
 function QueryMonitorPanel({ monitors, run, runTokens, runDuration }: { monitors: QueryMonitor[]; run: Run; runTokens: TokenSummary; runDuration: number }) {
@@ -580,7 +709,7 @@ function FragmentRow({ label, left, right, invert }: { label: string; left: numb
   return <><div>{label}</div><div>{pct(left)}</div><div className={improved ? 'positive' : ''}>{pct(right)}</div></>
 }
 
-function GapsPage({ runs, standards, refresh, notify }: { runs: Run[]; standards: StandardSummary[]; refresh: () => Promise<void>; notify: (text: string, error?: boolean) => void }) {
+function GapsPage({ runs, refresh, notify }: { runs: Run[]; refresh: () => Promise<void>; notify: (text: string, error?: boolean) => void }) {
   const completed = runs.filter(item => item.status === 'completed')
   const [runId, setRunId] = useState(completed[0]?.id || '')
   const [suggestions, setSuggestions] = useState<Suggestion[]>([])
@@ -590,13 +719,6 @@ function GapsPage({ runs, standards, refresh, notify }: { runs: Run[]; standards
   const [reason, setReason] = useState('')
   useEffect(() => { void api.suggestions(runId || undefined).then(setSuggestions).catch(error => notify(error.message, true)) }, [runId, notify])
   async function mine() { if (!runId) return; setBusy(true); try { const result = await api.mine(runId); setSuggestions(result.suggestions); notify(result.suggestions.length ? `生成 ${result.suggestions.length} 条建议` : '没有达到聚类阈值的失败模式') } catch (error) { notify(error instanceof Error ? error.message : '挖掘失败', true) } finally { setBusy(false) } }
-  function openEdit(item: Suggestion) {
-    const run = runs.find(value => value.id === item.run_id); const standard = standards.find(value => value.id === run?.standard_id); const id = item.payload.target_rule_id
-    const allRules = standard ? [...standard.compiled.definition_rules, ...standard.compiled.decision_rules.boundary_rules, ...standard.compiled.decision_rules.priority_rules] : []
-    const rule = allRules.find(value => value.rule_id === id)
-    if (!run || !standard || !id || !rule) { notify('建议未定位到可修改的现有 Rule', true); return }
-    setEditing(item); setRuleJson(JSON.stringify(rule, null, 2)); setReason(item.payload.proposed_change)
-  }
   async function reviseAndRerun() {
     if (!editing) return
     const run = runs.find(value => value.id === editing.run_id); if (!run) return
