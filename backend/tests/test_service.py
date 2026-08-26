@@ -177,6 +177,25 @@ class ConcurrencyTrackingProvider(TestProvider):
             self.in_flight -= 1
 
 
+class TraceVerifierProvider(TestProvider):
+    def __init__(self, verification: dict | None = None) -> None:
+        self.verification = verification
+        self.candidate_calls = 0
+        self.annotation_calls = 0
+        self.verifier_calls = 0
+
+    async def structured(self, model, system, user, response_model, temperature=0):
+        if response_model.__name__ == "CandidateDecision":
+            self.candidate_calls += 1
+        elif response_model.__name__ == "AnnotationDecision":
+            self.annotation_calls += 1
+        elif response_model.__name__ == "VerificationDecision":
+            self.verifier_calls += 1
+            if self.verification is not None:
+                return response_model.model_validate(self.verification)
+        return await super().structured(model, system, user, response_model, temperature)
+
+
 class FailOnTextProvider(TestProvider):
     """Fails the query whose text is `marker`, leaving siblings to succeed."""
 
@@ -464,3 +483,105 @@ async def test_parallel_run_does_not_publish_a_single_current_item(store) -> Non
     # in-flight set from per-item events instead of a thrashing single value.
     assert store.get_run(parallel["id"])["current_item_id"] is None
 
+
+@pytest.mark.asyncio
+async def test_trace_replicas_are_adjudicated_and_persisted_once_per_query(store) -> None:
+    current = store.create_standard("source", standard(), status="active")
+    dataset = store.create_dataset("cases", "cases.csv", [{"text": "贷款利率"}])
+    run = store.create_run(dataset["id"], current["id"], trace_replicas=3)
+    provider = TraceVerifierProvider()
+
+    await LabelSpecService(store, provider).process_run(run["id"])
+
+    annotation = store.list_annotations(run["id"])[0]
+    assert store.get_run(run["id"])["trace_replicas"] == 3
+    assert len(annotation["replicas"]) == 3
+    assert annotation["verifier"]["diagnosis"] == "CONSENSUS"
+    assert annotation["label"] == "金融/贷款"
+    assert annotation["labels"] == ["金融/贷款"]
+    assert provider.candidate_calls == 3
+    assert provider.annotation_calls == 3
+    assert provider.verifier_calls == 1
+    verifier_events = [
+        event for event in store.list_annotation_events(run["id"])
+        if event["stage"] == "VERIFIER"
+    ]
+    assert verifier_events
+
+
+@pytest.mark.asyncio
+async def test_multi_intent_verifier_forces_review_and_preserves_multiple_labels(store) -> None:
+    current = store.create_standard("source", standard(), status="active")
+    dataset = store.create_dataset("cases", "cases.csv", [{"text": "买车贷款利率"}])
+    run = store.create_run(dataset["id"], current["id"], trace_replicas=3)
+    provider = TraceVerifierProvider({
+        "outcome": "MULTI_INTENT",
+        "diagnosis": "MULTI_INTENT",
+        "label": "金融/贷款",
+        "labels": ["金融/贷款", "汽车/购车"],
+        "confidence": 0.62,
+        "needs_review": True,
+        "summary": "同一 query 包含贷款和购车两个意图",
+        "reason": "两个意图均有独立证据",
+    })
+
+    await LabelSpecService(store, provider).process_run(run["id"])
+
+    annotation = store.list_annotations(run["id"])[0]
+    assert annotation["route"] == "REVIEW"
+    assert annotation["labels"] == ["金融/贷款", "汽车/购车"]
+    assert annotation["verifier"]["diagnosis"] == "MULTI_INTENT"
+    assert "VERIFIER_MULTI_INTENT" in [reason["code"] for reason in annotation["route_reasons"]]
+
+
+@pytest.mark.asyncio
+async def test_spec_gap_verifier_persists_intent_and_standard_feedback(store) -> None:
+    current = store.create_standard("source", standard(), status="active")
+    dataset = store.create_dataset("cases", "cases.csv", [{"text": "贷款展期怎么办"}])
+    run = store.create_run(dataset["id"], current["id"], trace_replicas=3)
+    provider = TraceVerifierProvider({
+        "outcome": "SPEC_GAP",
+        "diagnosis": "SPEC_GAP",
+        "label": "金融/贷款",
+        "labels": ["金融/贷款"],
+        "confidence": 0.45,
+        "needs_review": True,
+        "summary": "意图清晰但标准没有覆盖展期",
+        "reason": "应补充贷款展期定义",
+        "inferred_intent": "贷款展期咨询",
+        "standard_feedback": {
+            "suggestion_type": "DEFINITION",
+            "reason": "新增贷款展期的 Definition",
+            "proposed_change": "补充展期、延期还款相关表述",
+        },
+    })
+
+    await LabelSpecService(store, provider).process_run(run["id"])
+
+    annotation = store.list_annotations(run["id"])[0]
+    assert annotation["route"] == "REVIEW"
+    assert annotation["verifier"]["inferred_intent"] == "贷款展期咨询"
+    assert annotation["verifier"]["standard_feedback"]["suggestion_type"] == "DEFINITION"
+    assert annotation["decision"]["needs_review"] is True
+
+
+@pytest.mark.asyncio
+async def test_illegal_verifier_label_falls_back_to_majority_candidate(store) -> None:
+    current = store.create_standard("source", standard(), status="active")
+    dataset = store.create_dataset("cases", "cases.csv", [{"text": "贷款利率"}])
+    run = store.create_run(dataset["id"], current["id"], trace_replicas=3)
+    provider = TraceVerifierProvider({
+        "outcome": "MAJORITY",
+        "diagnosis": "MAJORITY",
+        "label": "不存在/标签",
+        "labels": ["不存在/标签"],
+        "confidence": 0.7,
+        "summary": "Verifier 给出了标准外标签",
+    })
+
+    await LabelSpecService(store, provider).process_run(run["id"])
+
+    annotation = store.list_annotations(run["id"])[0]
+    assert annotation["label"] == "金融/贷款"
+    assert annotation["labels"] == ["金融/贷款"]
+    assert annotation["decision"]["leaf_rule_used"] == "D002"

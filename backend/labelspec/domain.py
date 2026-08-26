@@ -194,9 +194,22 @@ class VerificationIssue(BaseModel):
 
 
 class VerificationDecision(BaseModel):
-    outcome: Literal["PASS", "REVIEW", "SKIPPED"]
+    outcome: Literal[
+        "PASS", "REVIEW", "SKIPPED", "CONSENSUS", "MAJORITY",
+        "ADJUDICATED", "MULTI_INTENT", "UNCLEAR_EXPRESSION", "SPEC_GAP", "INVALID",
+    ] = "SKIPPED"
     issues: List[VerificationIssue] = Field(default_factory=list)
-    summary: str = Field(min_length=1)
+    summary: str = "未记录独立核验结果"
+    diagnosis: Optional[Literal[
+        "CONSENSUS", "MAJORITY", "MULTI_INTENT", "UNCLEAR_EXPRESSION", "SPEC_GAP", "INVALID"
+    ]] = None
+    label: Optional[str] = None
+    labels: List[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+    needs_review: bool = False
+    reason: str = ""
+    inferred_intent: Optional[str] = None
+    standard_feedback: Optional[Dict[str, Any]] = None
 
     @model_validator(mode="after")
     def outcome_matches_issues(self) -> "VerificationDecision":
@@ -207,6 +220,8 @@ class VerificationDecision(BaseModel):
             raise ValueError("REVIEW 必须包含至少一个 BLOCKING issue")
         if self.outcome == "SKIPPED" and self.issues:
             raise ValueError("SKIPPED 不能包含 issue")
+        if self.outcome in {"MULTI_INTENT", "UNCLEAR_EXPRESSION", "SPEC_GAP", "INVALID"}:
+            self.needs_review = True
         return self
 
 
@@ -231,10 +246,18 @@ class DisclosureTrace(BaseModel):
     historical_cases: List[Dict[str, Any]] = Field(default_factory=list)
 
 
+class TraceReplica(BaseModel):
+    replica_index: int = Field(ge=1)
+    candidates: List[str] = Field(default_factory=list)
+    decision: AnnotationDecision
+    disclosure: DisclosureTrace
+
+
 class AnnotationResult(BaseModel):
     item_id: str
     text: str
     label: str = Field(min_length=1)
+    labels: List[str] = Field(default_factory=list)
     candidates: List[str]
     rules_used: List[str]
     rule_reasons: Dict[str, str]
@@ -247,6 +270,7 @@ class AnnotationResult(BaseModel):
     # Legacy verifier payload is optional; it is no longer produced by the
     # annotation pipeline.
     verifier: Optional[VerificationDecision] = None
+    replicas: List[TraceReplica] = Field(default_factory=list)
 
 
 class MinerSuggestion(BaseModel):

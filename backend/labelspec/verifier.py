@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import json
 
-from .domain import AnnotationDecision, DisclosureTrace, VerificationDecision
+from .domain import (
+    AnnotationDecision,
+    CompiledStandard,
+    DisclosureTrace,
+    TraceReplica,
+    VerificationDecision,
+)
 from .provider import QianfanProvider
 
 
@@ -18,6 +24,14 @@ VERIFIER_SYSTEM = """你是独立的 LabelSpec Verifier。你的职责不是重�
 没有具体问题时 outcome=PASS、issues=[]。存在 BLOCKING issue 时 outcome=REVIEW，并准确说明 Rule ID 和原因。
 规则虽然被披露但对当前文本不适用，不算遗漏。不要因为没有 Boundary / Priority Rule 而制造问题。
 outcome 不得使用 SKIPPED。输出严格符合 JSON Schema。"""
+
+TRACE_VERIFIER_SYSTEM = """你是 LabelSpec 的多 Trace Verifier。你会看到同一个 query 的多次独立标注 Trace。
+比较 Trace 并仲裁最终合法叶子标签，同时诊断无法稳定决定的原因。
+diagnosis 只能是 CONSENSUS、MAJORITY、MULTI_INTENT、UNCLEAR_EXPRESSION、SPEC_GAP 或 INVALID。
+MULTI_INTENT 必须返回多个 labels 并人工审核；UNCLEAR_EXPRESSION 可以推测 inferred_intent 但必须人工审核；SPEC_GAP 表示意图清晰但标准覆盖不足，必须填写 inferred_intent 和 standard_feedback。
+standard_feedback.suggestion_type 只能是 DEFINITION、BOUNDARY 或 PRIORITY。
+只能从三条 Trace 候选的并集中选择合法叶子标签；如果候选并集不足以覆盖意图，输出 SPEC_GAP 或 INVALID，不要创造标签。
+CONSENSUS 或 MAJORITY 也必须检查 Definition、Exclude、Boundary 和 Priority 依据。输出严格符合 JSON Schema。"""
 
 
 async def verify(
@@ -38,6 +52,34 @@ async def verify(
     return await provider.structured(
         model=model,
         system=VERIFIER_SYSTEM,
+        user=json.dumps(prompt, ensure_ascii=False),
+        response_model=VerificationDecision,
+        temperature=0.0,
+    )
+
+
+async def verify_traces(
+    provider: QianfanProvider,
+    model: str,
+    text: str,
+    traces: list[TraceReplica],
+    standard: CompiledStandard,
+) -> VerificationDecision:
+    """Adjudicate independent traces for one query."""
+    candidate_union = sorted({candidate for trace in traces for candidate in trace.candidates})
+    prompt = {
+        "text": text,
+        "candidate_union": candidate_union,
+        "traces": [trace.model_dump(mode="json") for trace in traces],
+        "standard_context": {
+            "labels": [label.model_dump(mode="json") for label in standard.labels.labels],
+            "boundary_rules": [rule.model_dump(mode="json") for rule in standard.decision_rules.boundary_rules],
+            "priority_rules": [rule.model_dump(mode="json") for rule in standard.decision_rules.priority_rules],
+        },
+    }
+    return await provider.structured(
+        model=model,
+        system=TRACE_VERIFIER_SYSTEM,
         user=json.dumps(prompt, ensure_ascii=False),
         response_model=VerificationDecision,
         temperature=0.0,

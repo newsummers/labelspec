@@ -22,7 +22,7 @@ from .domain import ModelSettings
 from .miner import SpecGapMiner
 from .provider import MissingApiKeyError, ProviderError, QianfanProvider
 from .service import LabelSpecService
-from .store import MAX_RUN_CONCURRENCY, DatasetDeleteError, StandardDeleteError, Store
+from .store import MAX_RUN_CONCURRENCY, MAX_TRACE_REPLICAS, DatasetDeleteError, StandardDeleteError, Store
 from .validator import validate_standard
 from .yaml_io import standard_to_yaml_files
 from .taxonomy import parse_compiled_standard
@@ -65,6 +65,7 @@ class RunRequest(BaseModel):
     dataset_id: str
     standard_id: str
     concurrency: int = Field(default=1, ge=1, le=MAX_RUN_CONCURRENCY)
+    trace_replicas: int = Field(default=3, ge=1, le=MAX_TRACE_REPLICAS)
 
 
 class ReviewRequest(BaseModel):
@@ -101,6 +102,7 @@ class ImpactRunRequest(BaseModel):
     rule_id: str
     labels: List[str] = Field(default_factory=list)
     concurrency: Optional[int] = Field(default=None, ge=1, le=MAX_RUN_CONCURRENCY)
+    trace_replicas: Optional[int] = Field(default=None, ge=1, le=MAX_TRACE_REPLICAS)
 
 
 def _handle_error(exc: Exception) -> HTTPException:
@@ -442,7 +444,8 @@ def create_run(payload: RunRequest, background_tasks: BackgroundTasks) -> Dict[s
             raise ValueError("只能使用已激活的 Standard 运行标注")
         store.get_dataset(payload.dataset_id)
         run = store.create_run(
-            payload.dataset_id, payload.standard_id, concurrency=payload.concurrency
+            payload.dataset_id, payload.standard_id, concurrency=payload.concurrency,
+            trace_replicas=payload.trace_replicas,
         )
         background_tasks.add_task(service.process_run, run["id"])
         return run
@@ -460,6 +463,7 @@ def retry_run(
     run_id: str,
     background_tasks: BackgroundTasks,
     concurrency: Optional[int] = None,
+    trace_replicas: Optional[int] = None,
 ) -> Dict[str, Any]:
     try:
         run = store.get_run(run_id)
@@ -471,6 +475,10 @@ def retry_run(
             if not 1 <= concurrency <= MAX_RUN_CONCURRENCY:
                 raise ValueError(f"并行度必须在 1 到 {MAX_RUN_CONCURRENCY} 之间")
             updates["concurrency"] = concurrency
+        if trace_replicas is not None:
+            if not 1 <= trace_replicas <= MAX_TRACE_REPLICAS:
+                raise ValueError(f"Trace 副本数必须在 1 到 {MAX_TRACE_REPLICAS} 之间")
+            updates["trace_replicas"] = trace_replicas
         store.update_run(run_id, **updates)
         background_tasks.add_task(service.process_run, run_id)
         return store.get_run(run_id)
@@ -696,6 +704,7 @@ def impact_run(payload: ImpactRunRequest, background_tasks: BackgroundTasks) -> 
             payload.rule_id,
             payload.labels,
             payload.concurrency,
+            payload.trace_replicas,
         )
         background_tasks.add_task(service.process_run, run["id"])
         return run

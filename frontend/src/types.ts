@@ -80,6 +80,7 @@ export interface Run {
   total: number
   processed: number
   concurrency?: number
+  trace_replicas?: number
   current_item_id?: string
   current_stage?: string
   error?: string
@@ -135,6 +136,7 @@ export interface Annotation {
   item_id: string
   text: string
   label?: string
+  labels?: string[]
   gold_label?: string
   human_label?: string
   review_note?: string
@@ -169,6 +171,25 @@ export interface Annotation {
     global_priority_rules: PriorityRule[]
     historical_cases: Array<Record<string, unknown>>
   }
+  verifier?: {
+    outcome: string
+    diagnosis?: string
+    label?: string
+    labels?: string[]
+    confidence?: number
+    needs_review?: boolean
+    summary?: string
+    reason?: string
+    inferred_intent?: string
+    standard_feedback?: Record<string, unknown> | null
+    issues?: Array<Record<string, unknown>>
+  }
+  replicas?: Array<{
+    replica_index: number
+    candidates: string[]
+    decision: Annotation['decision']
+    disclosure: Annotation['disclosure']
+  }>
 }
 export interface RunDetail { run: Run; metrics: Metrics; annotations: Annotation[]; events: TraceEvent[]; model_calls: ModelCall[] }
 export interface Suggestion {

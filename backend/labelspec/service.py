@@ -5,6 +5,7 @@ import copy
 import json
 import logging
 import time
+from collections import Counter
 from contextlib import asynccontextmanager, nullcontext
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -18,11 +19,15 @@ from .domain import (
     DecisionStatus,
     DisclosureTrace,
     ModelSettings,
+    RouteReason,
+    TraceReplica,
+    VerificationDecision,
 )
 from .documents import ParsedDocument, parse_standard_document
 from .provider import QianfanProvider
 from .router import route_annotation
-from .store import Store, normalize_concurrency, utc_now
+from .store import Store, normalize_concurrency, normalize_trace_replicas, utc_now
+from .verifier import verify_traces
 from .taxonomy import descendants, label_path, parse_compiled_standard, upgrade_compiled_payload
 from .validator import validate_standard
 from .yaml_io import standard_to_yaml_files
@@ -269,6 +274,7 @@ class LabelSpecService:
         concurrency = normalize_concurrency(run.get("concurrency", 1))
         # Never start more workers than there is work for them to do.
         workers = max(1, min(concurrency, len(pending_items) or 1))
+        trace_replicas = normalize_trace_replicas(run.get("trace_replicas", 1))
         self._run_concurrency[run_id] = concurrency
         self.store.update_run(
             run_id,
@@ -287,12 +293,13 @@ class LabelSpecService:
                         "workers": workers,
                         "pending": len(pending_items),
                         "total": len(items),
+                        "trace_replicas": trace_replicas,
                     },
                 )
             await self._run_workers(
                 run_id, pending_items, standard, settings,
                 total=len(items), already_completed=completed_count,
-                workers=workers,
+                workers=workers, trace_replicas=trace_replicas,
             )
             await self._emit_event(
                 run_id, None, "RUN", "STAGE_COMPLETED", "success", "标注运行完成",
@@ -324,6 +331,7 @@ class LabelSpecService:
         total: int,
         already_completed: int,
         workers: int,
+        trace_replicas: int = 1,
     ) -> None:
         """Drain the pending queue with a bounded worker pool.
 
@@ -346,9 +354,21 @@ class LabelSpecService:
                 except asyncio.QueueEmpty:
                     return
                 try:
-                    await self._process_item(
-                        run_id, item, standard, settings, total, progress
-                    )
+                    if trace_replicas <= 1:
+                        await self._process_item(
+                            run_id, item, standard, settings, total, progress
+                        )
+                    else:
+                        replicas = await asyncio.gather(*[
+                            self._process_item(
+                                run_id, item, standard, settings, total, progress,
+                                persist=False, replica_index=index,
+                            )
+                            for index in range(1, trace_replicas + 1)
+                        ])
+                        await self._finalize_replicas(
+                            run_id, item, standard, settings, total, progress, replicas
+                        )
                 except BaseException as exc:  # noqa: BLE001 - re-raised by caller
                     failure.append(exc)
                     return
@@ -373,12 +393,14 @@ class LabelSpecService:
         settings: ModelSettings,
         total: int,
         progress: Dict[str, int],
-    ) -> None:
+        persist: bool = True,
+        replica_index: int = 1,
+    ) -> AnnotationResult:
         """Annotate one query end to end and persist its result."""
         await self._emit_event(
             run_id, item["id"], "QUERY", "STAGE_STARTED", "running",
             "开始处理 query",
-            metadata={"total": total},
+            metadata={"total": total, "replica_index": replica_index},
         )
         async with self._trace_stage(
             run_id, item["id"], "DISCLOSURE", "候选召回开始",
@@ -518,6 +540,8 @@ class LabelSpecService:
             decision=decision,
             disclosure=trace,
         )
+        if not persist:
+            return result
         async with self._trace_stage(
             run_id, item["id"], "PERSIST", "保存 query 标注结果",
         ):
@@ -531,6 +555,111 @@ class LabelSpecService:
             run_id, item["id"], "QUERY", "STAGE_COMPLETED", "success",
             f"query 处理完成（{completed}/{total}）",
             metadata={"completed": completed, "total": total, "route": route.value},
+        )
+        return result
+
+    async def _finalize_replicas(
+        self,
+        run_id: str,
+        item: Dict[str, Any],
+        standard: CompiledStandard,
+        settings: ModelSettings,
+        total: int,
+        progress: Dict[str, int],
+        results: Sequence[AnnotationResult],
+    ) -> None:
+        """Adjudicate independent traces and persist one query-level result."""
+        replicas = [
+            TraceReplica(
+                replica_index=index,
+                candidates=result.candidates,
+                decision=result.decision,
+                disclosure=result.disclosure,
+            )
+            for index, result in enumerate(results, start=1)
+        ]
+        try:
+            async with self._trace_stage(
+                run_id, item["id"], "VERIFIER", f"审核 {len(replicas)} 条独立 Trace",
+                model_role="verifier", model_id=settings.annotator_model,
+                metadata={"replicas": len(replicas)},
+            ):
+                verification = await verify_traces(
+                    self.provider, settings.annotator_model, item["text"], replicas, standard
+                )
+        except Exception as exc:
+            verification = VerificationDecision(
+                outcome="INVALID", diagnosis="INVALID", needs_review=True,
+                summary=f"Verifier 调用失败：{exc}", reason=str(exc),
+            )
+        labels = [result.label for result in results if result.label]
+        votes = Counter(labels)
+        majority_label, majority_count = votes.most_common(1)[0] if votes else (None, 0)
+        candidate_union = {candidate for replica in replicas for candidate in replica.candidates}
+        chosen_label = verification.label if verification.label in candidate_union else majority_label
+        verified_labels = list(dict.fromkeys(
+            label for label in verification.labels if label in candidate_union
+        ))
+        chosen_index = next(
+            (
+                index for index, result in enumerate(results)
+                if result.label == chosen_label
+                or chosen_label in result.disclosure.candidates
+            ),
+            0,
+        )
+        base = results[chosen_index]
+        diagnosis = verification.diagnosis
+        if not diagnosis:
+            diagnosis = "CONSENSUS" if majority_count == len(results) else "MAJORITY"
+        verification = verification.model_copy(update={"diagnosis": diagnosis})
+        blocking = diagnosis in {"MULTI_INTENT", "UNCLEAR_EXPRESSION", "SPEC_GAP", "INVALID"}
+        confidence = verification.confidence if verification.confidence > 0 else base.confidence
+        decision = base.decision.model_copy(update={
+            "label": chosen_label or base.label,
+            "confidence": confidence,
+            "needs_review": blocking or verification.needs_review,
+            "review_reason_codes": list(dict.fromkeys([
+                *base.decision.review_reason_codes,
+                *( [f"VERIFIER_{diagnosis}"] if blocking else []),
+            ])),
+            "reason": verification.reason or verification.summary or base.decision.reason,
+        })
+        selected_chain = next(
+            (chain for chain in base.disclosure.definitions if chain.leaf_path == decision.label),
+            None,
+        )
+        if selected_chain is None:
+            selected_chain = base.disclosure.definitions[0] if base.disclosure.definitions else None
+        if selected_chain is None:
+            raise ValueError("Verifier 未选择合法候选，且 Trace 没有可用 Definition")
+        decision = decision.model_copy(update={"leaf_rule_used": selected_chain.chain[-1].rule_id})
+        route, reasons = route_annotation(decision, threshold=settings.auto_accept_threshold)
+        reasons.append(RouteReason(
+            code=f"VERIFIER_{diagnosis}", source="VERIFIER",
+            message=verification.reason or verification.summary,
+        ))
+        final = base.model_copy(update={
+            "label": decision.label,
+            "confidence": decision.confidence,
+            "route": route,
+            "route_reasons": reasons,
+            "decision": decision,
+            "verifier": verification,
+            "replicas": replicas,
+            "labels": verified_labels or ([chosen_label] if chosen_label else []),
+            "candidates": sorted(candidate_union),
+        })
+        async with self._trace_stage(run_id, item["id"], "PERSIST", "保存 query 仲裁结果"):
+            self.store.save_annotation(run_id, final.model_dump(mode="json"))
+        progress["completed"] += 1
+        completed = progress["completed"]
+        self.store.update_run(run_id, processed=completed)
+        await self._emit_event(
+            run_id, item["id"], "QUERY", "STAGE_COMPLETED", "success",
+            f"query 处理完成（{completed}/{total}）",
+            metadata={"completed": completed, "total": total, "route": route.value,
+                      "trace_replicas": len(replicas), "diagnosis": diagnosis},
         )
 
     async def _ensure_valid_decision(
@@ -938,6 +1067,7 @@ class LabelSpecService:
         rule_id: str,
         labels: List[str],
         concurrency: Optional[int] = None,
+        trace_replicas: Optional[int] = None,
     ) -> Dict[str, Any]:
         source = self.store.get_run(source_run_id)
         item_ids = self.store.affected_item_ids(source_run_id, rule_id, labels)
@@ -948,4 +1078,5 @@ class LabelSpecService:
             parent_run_id=source_run_id,
             # Impact reruns default to the parallelism the source run used.
             concurrency=source.get("concurrency", 1) if concurrency is None else concurrency,
+            trace_replicas=source.get("trace_replicas", 1) if trace_replicas is None else trace_replicas,
         )

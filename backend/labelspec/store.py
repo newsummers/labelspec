@@ -24,6 +24,7 @@ class DatasetDeleteError(ValueError):
 # Upper bound for per-run annotation parallelism. Qianfan rate limits, not local
 # CPU, are the binding constraint, so the ceiling stays deliberately modest.
 MAX_RUN_CONCURRENCY = 16
+MAX_TRACE_REPLICAS = 5
 
 
 def normalize_concurrency(value: Any) -> int:
@@ -33,6 +34,15 @@ def normalize_concurrency(value: Any) -> int:
     except (TypeError, ValueError):
         return 1
     return max(1, min(MAX_RUN_CONCURRENCY, parsed))
+
+
+def normalize_trace_replicas(value: Any) -> int:
+    """Clamp per-query independent trace count to [1, MAX_TRACE_REPLICAS]."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(MAX_TRACE_REPLICAS, parsed))
 
 
 def utc_now() -> str:
@@ -165,6 +175,7 @@ class Store:
                     total INTEGER NOT NULL DEFAULT 0,
                     processed INTEGER NOT NULL DEFAULT 0,
                     concurrency INTEGER NOT NULL DEFAULT 1,
+                    trace_replicas INTEGER NOT NULL DEFAULT 1,
                     scope_item_ids_json TEXT,
                     error TEXT,
                     current_item_id TEXT,
@@ -188,6 +199,8 @@ class Store:
                     decision_json TEXT NOT NULL DEFAULT '{}',
                     disclosure_json TEXT NOT NULL,
                     verifier_json TEXT NOT NULL,
+                    replicas_json TEXT NOT NULL DEFAULT '[]',
+                    labels_json TEXT NOT NULL DEFAULT '[]',
                     human_label TEXT,
                     review_note TEXT,
                     reviewed_at TEXT,
@@ -318,7 +331,19 @@ class Store:
                 db.execute(
                     "ALTER TABLE annotation_runs ADD COLUMN concurrency INTEGER NOT NULL DEFAULT 1"
                 )
+            if "trace_replicas" not in run_columns:
+                db.execute(
+                    "ALTER TABLE annotation_runs ADD COLUMN trace_replicas INTEGER NOT NULL DEFAULT 1"
+                )
             annotation_columns = {row["name"] for row in db.execute("PRAGMA table_info(annotations)")}
+            if "replicas_json" not in annotation_columns:
+                db.execute(
+                    "ALTER TABLE annotations ADD COLUMN replicas_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "labels_json" not in annotation_columns:
+                db.execute(
+                    "ALTER TABLE annotations ADD COLUMN labels_json TEXT NOT NULL DEFAULT '[]'"
+                )
             if "decision_json" not in annotation_columns:
                 db.execute("ALTER TABLE annotations ADD COLUMN decision_json TEXT NOT NULL DEFAULT '{}'")
 
@@ -795,6 +820,7 @@ class Store:
         scope_item_ids: Optional[List[str]] = None,
         parent_run_id: Optional[str] = None,
         concurrency: int = 1,
+        trace_replicas: int = 1,
     ) -> Dict[str, Any]:
         run_id = str(uuid.uuid4())
         total = len(scope_item_ids) if scope_item_ids is not None else self.get_dataset(dataset_id)["item_count"]
@@ -802,9 +828,11 @@ class Store:
             db.execute(
                 """INSERT INTO annotation_runs
                    (id, dataset_id, standard_id, parent_run_id, status, total, processed,
-                   concurrency, scope_item_ids_json, current_item_id, current_stage, created_at)
-                   VALUES (?, ?, ?, ?, 'queued', ?, 0, ?, ?, NULL, NULL, ?)""",
-                (run_id, dataset_id, standard_id, parent_run_id, total, normalize_concurrency(concurrency), _json(scope_item_ids) if scope_item_ids is not None else None, utc_now()),
+                   concurrency, trace_replicas, scope_item_ids_json, current_item_id, current_stage, created_at)
+                   VALUES (?, ?, ?, ?, 'queued', ?, 0, ?, ?, ?, NULL, NULL, ?)""",
+                (run_id, dataset_id, standard_id, parent_run_id, total,
+                 normalize_concurrency(concurrency), normalize_trace_replicas(trace_replicas),
+                 _json(scope_item_ids) if scope_item_ids is not None else None, utc_now()),
             )
         return self.get_run(run_id)
 
@@ -839,12 +867,15 @@ class Store:
         allowed = {
             "status", "processed", "error", "completed_at",
             "current_item_id", "current_stage", "concurrency",
+            "trace_replicas",
         }
         data = {key: value for key, value in fields.items() if key in allowed}
         if not data:
             return
         if "concurrency" in data:
             data["concurrency"] = normalize_concurrency(data["concurrency"])
+        if "trace_replicas" in data:
+            data["trace_replicas"] = normalize_trace_replicas(data["trace_replicas"])
         assignments = ", ".join(f"{key} = ?" for key in data)
         with self.connect() as db:
             db.execute(f"UPDATE annotation_runs SET {assignments} WHERE id = ?", [*data.values(), run_id])
@@ -957,8 +988,8 @@ class Store:
                 """INSERT OR REPLACE INTO annotations
                    (id, run_id, item_id, label, candidates_json, rules_used_json,
                     rule_reasons_json, evidence, confidence, route, route_reasons_json,
-                    decision_json, disclosure_json, verifier_json, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   decision_json, disclosure_json, verifier_json, replicas_json, labels_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     annotation_id,
                     run_id,
@@ -974,6 +1005,8 @@ class Store:
                     _json(result.get("decision", {})),
                     _json(result.get("disclosure", {})),
                     _json(result.get("verifier", {})),
+                    _json(result.get("replicas", [])),
+                    _json(result.get("labels", [])),
                     utc_now(),
                 ),
             )
@@ -1004,7 +1037,7 @@ class Store:
 
     def _annotation_row(self, row: sqlite3.Row) -> Dict[str, Any]:
         result = dict(row)
-        for column in ("candidates_json", "rules_used_json", "rule_reasons_json", "route_reasons_json", "decision_json", "disclosure_json", "verifier_json"):
+        for column in ("candidates_json", "rules_used_json", "rule_reasons_json", "route_reasons_json", "decision_json", "disclosure_json", "verifier_json", "replicas_json", "labels_json"):
             result[column[:-5]] = _loads(row[column], [] if column.endswith("s_json") else {})
         result["route_reasons"] = self._normalize_route_reasons(result.get("route_reasons", []))
         result["verifier"] = self._normalize_verifier(result.get("verifier", {}))
