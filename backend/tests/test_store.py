@@ -1,8 +1,38 @@
 import pytest
 
-from labelspec.store import DatasetDeleteError, StandardDeleteError
+from labelspec.store import (
+    MAX_RUN_CONCURRENCY,
+    DatasetDeleteError,
+    StandardDeleteError,
+    normalize_concurrency,
+)
 
 from .factories import standard
+
+
+def test_concurrency_is_clamped_to_the_supported_range() -> None:
+    assert normalize_concurrency(4) == 4
+    assert normalize_concurrency(0) == 1
+    assert normalize_concurrency(-3) == 1
+    assert normalize_concurrency(MAX_RUN_CONCURRENCY + 50) == MAX_RUN_CONCURRENCY
+    # Missing or malformed values fall back to serial execution.
+    assert normalize_concurrency(None) == 1
+    assert normalize_concurrency("abc") == 1
+    assert normalize_concurrency("6") == 6
+
+
+def test_run_persists_and_clamps_its_concurrency(store) -> None:
+    saved = store.create_standard("source", standard(), status="active")
+    dataset = store.create_dataset("data", "data.csv", [{"text": "一条数据"}])
+
+    default_run = store.create_run(dataset["id"], saved["id"])
+    assert store.get_run(default_run["id"])["concurrency"] == 1
+
+    run = store.create_run(dataset["id"], saved["id"], concurrency=MAX_RUN_CONCURRENCY + 10)
+    assert store.get_run(run["id"])["concurrency"] == MAX_RUN_CONCURRENCY
+
+    store.update_run(run["id"], concurrency=0)
+    assert store.get_run(run["id"])["concurrency"] == 1
 
 
 def test_dataset_assigns_unique_internal_ids(store) -> None:

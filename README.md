@@ -94,7 +94,7 @@ labelspec validate \
   --decisions-yaml compiled/decision_rules.yaml
 labelspec activate <standard-id>
 labelspec import-data cases.jsonl
-labelspec annotate <dataset-id> <standard-id>
+labelspec annotate <dataset-id> <standard-id> --concurrency 4
 labelspec mine <run-id>
 labelspec revise <standard-id> <rule-id> edited-rule.json --reason "Reviewed change"
 labelspec impact-rerun <source-run-id> <target-standard-id> <rule-id>

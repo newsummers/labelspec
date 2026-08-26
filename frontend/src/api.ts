@@ -53,7 +53,7 @@ export const api = {
     return request<Dataset>('/api/datasets', { method: 'POST', body: form })
   },
   runs: () => request<Run[]>('/api/runs'),
-  createRun: (dataset_id: string, standard_id: string) => request<Run>('/api/runs', { method: 'POST', body: JSON.stringify({ dataset_id, standard_id }) }),
+  createRun: (dataset_id: string, standard_id: string, concurrency = 1) => request<Run>('/api/runs', { method: 'POST', body: JSON.stringify({ dataset_id, standard_id, concurrency }) }),
   retryRun: (id: string) => request<Run>(`/api/runs/${id}/retry`, { method: 'POST' }),
   run: (id: string) => request<RunDetail>(`/api/runs/${id}`),
   review: (id: string, human_label: string, note: string) => request(`/api/annotations/${id}/review`, { method: 'POST', body: JSON.stringify({ human_label, note }) }),

@@ -21,6 +21,20 @@ class DatasetDeleteError(ValueError):
     """Raised when deleting a dataset would break annotation history."""
 
 
+# Upper bound for per-run annotation parallelism. Qianfan rate limits, not local
+# CPU, are the binding constraint, so the ceiling stays deliberately modest.
+MAX_RUN_CONCURRENCY = 16
+
+
+def normalize_concurrency(value: Any) -> int:
+    """Clamp a requested parallelism to [1, MAX_RUN_CONCURRENCY]."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(MAX_RUN_CONCURRENCY, parsed))
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -150,6 +164,7 @@ class Store:
                     status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'completed', 'failed')),
                     total INTEGER NOT NULL DEFAULT 0,
                     processed INTEGER NOT NULL DEFAULT 0,
+                    concurrency INTEGER NOT NULL DEFAULT 1,
                     scope_item_ids_json TEXT,
                     error TEXT,
                     current_item_id TEXT,
@@ -297,6 +312,12 @@ class Store:
                 db.execute("ALTER TABLE annotation_runs ADD COLUMN current_item_id TEXT")
             if "current_stage" not in run_columns:
                 db.execute("ALTER TABLE annotation_runs ADD COLUMN current_stage TEXT")
+            if "concurrency" not in run_columns:
+                # Historical runs were executed one query at a time. Keeping the
+                # default at 1 preserves their recorded semantics.
+                db.execute(
+                    "ALTER TABLE annotation_runs ADD COLUMN concurrency INTEGER NOT NULL DEFAULT 1"
+                )
             annotation_columns = {row["name"] for row in db.execute("PRAGMA table_info(annotations)")}
             if "decision_json" not in annotation_columns:
                 db.execute("ALTER TABLE annotations ADD COLUMN decision_json TEXT NOT NULL DEFAULT '{}'")
@@ -773,6 +794,7 @@ class Store:
         standard_id: str,
         scope_item_ids: Optional[List[str]] = None,
         parent_run_id: Optional[str] = None,
+        concurrency: int = 1,
     ) -> Dict[str, Any]:
         run_id = str(uuid.uuid4())
         total = len(scope_item_ids) if scope_item_ids is not None else self.get_dataset(dataset_id)["item_count"]
@@ -780,9 +802,9 @@ class Store:
             db.execute(
                 """INSERT INTO annotation_runs
                    (id, dataset_id, standard_id, parent_run_id, status, total, processed,
-                   scope_item_ids_json, current_item_id, current_stage, created_at)
-                   VALUES (?, ?, ?, ?, 'queued', ?, 0, ?, NULL, NULL, ?)""",
-                (run_id, dataset_id, standard_id, parent_run_id, total, _json(scope_item_ids) if scope_item_ids is not None else None, utc_now()),
+                   concurrency, scope_item_ids_json, current_item_id, current_stage, created_at)
+                   VALUES (?, ?, ?, ?, 'queued', ?, 0, ?, ?, NULL, NULL, ?)""",
+                (run_id, dataset_id, standard_id, parent_run_id, total, normalize_concurrency(concurrency), _json(scope_item_ids) if scope_item_ids is not None else None, utc_now()),
             )
         return self.get_run(run_id)
 
@@ -816,11 +838,13 @@ class Store:
     def update_run(self, run_id: str, **fields: Any) -> None:
         allowed = {
             "status", "processed", "error", "completed_at",
-            "current_item_id", "current_stage",
+            "current_item_id", "current_stage", "concurrency",
         }
         data = {key: value for key, value in fields.items() if key in allowed}
         if not data:
             return
+        if "concurrency" in data:
+            data["concurrency"] = normalize_concurrency(data["concurrency"])
         assignments = ", ".join(f"{key} = ?" for key in data)
         with self.connect() as db:
             db.execute(f"UPDATE annotation_runs SET {assignments} WHERE id = ?", [*data.values(), run_id])

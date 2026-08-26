@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import inspect
 import logging
+import random
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -21,6 +23,13 @@ _telemetry_context: ContextVar[Dict[str, Any]] = ContextVar(
     "labelspec_telemetry_context", default={}
 )
 
+# Running many queries in parallel multiplies request rate, so throttling and
+# transient upstream faults have to be absorbed here instead of failing the run.
+RETRY_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+MAX_TRANSPORT_ATTEMPTS = 4
+RETRY_BASE_DELAY_SECONDS = 1.0
+RETRY_MAX_DELAY_SECONDS = 30.0
+
 
 class ProviderError(RuntimeError):
     pass
@@ -28,6 +37,27 @@ class ProviderError(RuntimeError):
 
 class MissingApiKeyError(ProviderError):
     pass
+
+
+def _is_retryable(exc: httpx.HTTPError) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in RETRY_STATUS_CODES
+    # Timeouts and connection resets are transient by nature.
+    return isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError))
+
+
+def _retry_delay(exc: httpx.HTTPError, attempt: int) -> float:
+    """Honour Retry-After when present, otherwise exponential backoff with jitter."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        header = exc.response.headers.get("retry-after")
+        if header:
+            try:
+                return max(0.0, min(RETRY_MAX_DELAY_SECONDS, float(header.strip())))
+            except ValueError:
+                pass
+    backoff = min(RETRY_MAX_DELAY_SECONDS, RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)))
+    # Full jitter keeps parallel workers from retrying in lockstep.
+    return backoff * (0.5 + random.random() / 2)
 
 
 class QianfanProvider:
@@ -155,39 +185,38 @@ class QianfanProvider:
         if not inputs:
             return []
         vectors: List[List[float]] = []
-        async with httpx.AsyncClient(timeout=None) as client:
-            for start in range(0, len(inputs), 16):
-                batch = inputs[start : start + 16]
-                started = time.perf_counter()
-                try:
-                    response = await client.post(
-                        f"{self.settings.qianfan_base_url.rstrip('/')}/embeddings",
-                        headers=self._headers(),
-                        json={"model": model, "input": batch, "encoding_format": "float"},
-                    )
-                    response.raise_for_status()
-                except httpx.HTTPError as exc:
-                    await self._record_call(
-                        operation="embeddings",
-                        attempt=start // 16 + 1,
-                        model=model,
-                        started=started,
-                        status="error",
-                        error=self._http_error("Embedding 请求失败", exc),
-                    )
-                    raise ProviderError(self._http_error("Embedding 请求失败", exc)) from exc
-                payload = response.json()
-                rows = sorted(payload.get("data", []), key=lambda row: row.get("index", 0))
-                vectors.extend(row.get("embedding", []) for row in rows)
+        for start in range(0, len(inputs), 16):
+            batch = inputs[start : start + 16]
+            started = time.perf_counter()
+            try:
+                response = await self._post_with_retry(
+                    "embeddings",
+                    {"model": model, "input": batch, "encoding_format": "float"},
+                    operation="embeddings",
+                    attempt=start // 16 + 1,
+                )
+            except httpx.HTTPError as exc:
                 await self._record_call(
                     operation="embeddings",
                     attempt=start // 16 + 1,
                     model=model,
                     started=started,
-                    status="success",
-                    usage=payload.get("usage") or {},
-                    request_id=self._request_id(response, payload),
+                    status="error",
+                    error=self._http_error("Embedding 请求失败", exc),
                 )
+                raise ProviderError(self._http_error("Embedding 请求失败", exc)) from exc
+            payload = response.json()
+            rows = sorted(payload.get("data", []), key=lambda row: row.get("index", 0))
+            vectors.extend(row.get("embedding", []) for row in rows)
+            await self._record_call(
+                operation="embeddings",
+                attempt=start // 16 + 1,
+                model=model,
+                started=started,
+                status="success",
+                usage=payload.get("usage") or {},
+                request_id=self._request_id(response, payload),
+            )
         if len(vectors) != len(inputs) or any(not vector for vector in vectors):
             raise ProviderError("Embedding 返回数量或向量内容不完整")
         return vectors
@@ -205,13 +234,9 @@ class QianfanProvider:
         response: Optional[httpx.Response] = None
         response_payload: Dict[str, Any] = {}
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
-                response = await client.post(
-                    f"{self.settings.qianfan_base_url.rstrip('/')}/chat/completions",
-                    headers=self._headers(),
-                    json=payload,
-                )
-                response.raise_for_status()
+            response = await self._post_with_retry(
+                "chat/completions", payload, operation=operation, attempt=attempt
+            )
             response_payload = response.json()
             content = response_payload["choices"][0]["message"]["content"]
         except httpx.HTTPError as exc:
@@ -238,6 +263,36 @@ class QianfanProvider:
             request_id=self._request_id(response, response_payload),
         )
         return content
+
+    async def _post_with_retry(
+        self,
+        path: str,
+        payload: Dict[str, Any],
+        operation: str,
+        attempt: int,
+    ) -> httpx.Response:
+        """POST to Qianfan, retrying throttling and transient upstream faults."""
+        url = f"{self.settings.qianfan_base_url.rstrip('/')}/{path}"
+        headers = self._headers()
+        last_error: httpx.HTTPError
+        for transport_attempt in range(1, MAX_TRANSPORT_ATTEMPTS + 1):
+            try:
+                async with httpx.AsyncClient(timeout=None) as client:
+                    response = await client.post(url, headers=headers, json=payload)
+                    response.raise_for_status()
+                    return response
+            except httpx.HTTPError as exc:
+                last_error = exc
+                if transport_attempt == MAX_TRANSPORT_ATTEMPTS or not _is_retryable(exc):
+                    raise
+                delay = _retry_delay(exc, transport_attempt)
+                logger.warning(
+                    "%s 第 %d/%d 次传输失败（%s），%.1fs 后重试",
+                    operation, transport_attempt, MAX_TRANSPORT_ATTEMPTS,
+                    self._http_error("请求被拒绝", exc), delay,
+                )
+                await asyncio.sleep(delay)
+        raise last_error
 
     async def _structured_chat(
         self, payload: Dict[str, Any], operation: str, attempt: int

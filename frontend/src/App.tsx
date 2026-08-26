@@ -389,6 +389,7 @@ function DatasetsPage({ datasets, standards, refresh, notify, setPage }: { datas
   const [selectedId, setSelectedId] = useState(datasets[0]?.id || '')
   const [items, setItems] = useState<Array<{ id: string; source_id?: string; text: string; gold_label?: string }>>([])
   const [standardId, setStandardId] = useState(standards.find(item => item.status === 'active')?.id || '')
+  const [concurrency, setConcurrency] = useState(4)
   const [file, setFile] = useState<File | null>(null)
   const [datasetName, setDatasetName] = useState('')
   const [busy, setBusy] = useState(false)
@@ -422,14 +423,14 @@ function DatasetsPage({ datasets, standards, refresh, notify, setPage }: { datas
       URL.revokeObjectURL(url)
     } catch (error) { notify(error instanceof Error ? error.message : '获取数据模板失败', true) }
   }
-  async function start() { if (!selectedId || !standardId) return; setBusy(true); try { await api.createRun(selectedId, standardId); notify('标注运行已创建'); await refresh(); setPage('runs') } catch (error) { notify(error instanceof Error ? error.message : '创建运行失败', true) } finally { setBusy(false) } }
+  async function start() { if (!selectedId || !standardId) return; setBusy(true); try { await api.createRun(selectedId, standardId, concurrency); notify(concurrency > 1 ? `标注运行已创建，并行度 ${concurrency}` : '标注运行已创建'); await refresh(); setPage('runs') } catch (error) { notify(error instanceof Error ? error.message : '创建运行失败', true) } finally { setBusy(false) } }
   return <>
     <PageHead title="数据集" meta={`${datasets.reduce((sum, item) => sum + item.item_count, 0)} 条数据`}><div className="actions"><button className="btn ghost" onClick={() => void downloadTemplate()} title="下载 CSV 数据模板"><FileDown size={15} />数据模板</button><button className="btn" disabled={busy} onClick={() => void demo()}><FlaskConical size={15} />导入演示数据</button></div></PageHead>
     <div className="panel" style={{ marginBottom: 16 }}><div className="panel-body"><div className="field-row dataset-upload-grid"><div className="field"><label>数据文件</label><input className="input" type="file" accept=".csv,.xlsx,.txt,.jsonl,.ndjson" onChange={event => setFile(event.target.files?.[0] || null)} /></div><div className="field"><label>数据集名称</label><input className="input" value={datasetName} placeholder={file?.name.replace(/\.[^.]+$/, '') || ''} onChange={event => setDatasetName(event.target.value)} /></div><button className="btn primary" style={{ alignSelf: 'end' }} disabled={!file || busy} onClick={() => void upload()}>{busy ? <Spinner /> : <Upload size={15} />}导入</button></div><div className="hint dataset-upload-hint">推荐 CSV；模板包含 text 和可选 gold_label，TXT 每行一条 text</div><div className="dataset-format-help"><strong>字段说明：</strong><code>text</code> 是待分类文本；<code>gold_label</code> 是可选的人工真实标签，用于评估和规则改进。模板中的 <code>gold_label</code> 可以留空。</div></div></div>
     <div className="split">
       <div className="panel">{datasets.length ? <div className="list">{datasets.map(item => <div className={`list-item dataset-list-item ${selectedId === item.id ? 'selected' : ''}`} key={item.id} onClick={() => setSelectedId(item.id)}><div><div className="list-title">{item.name}</div><div className="list-meta"><span>{item.item_count} Cases</span><span>{item.filename || '内置数据'}</span><span>{date(item.created_at)}</span></div></div><button className="btn icon danger" disabled={busy} onClick={event => { event.stopPropagation(); void removeDataset(item) }} title="删除数据集"><Trash2 size={15} /></button></div>)}</div> : <Empty icon={Database} title="暂无数据集" />}</div>
       <div className="stack">
-        <div className="panel"><div className="panel-head"><h2>创建标注运行</h2></div><div className="panel-body"><div className="field-row"><div className="field"><label>当前数据集</label><select className="select" value={selectedId} onChange={event => setSelectedId(event.target.value)}><option value="">选择数据集</option>{datasets.map(item => <option key={item.id} value={item.id}>{item.name} · {item.item_count}</option>)}</select></div><div className="field"><label>Standard</label><select className="select" value={standardId} onChange={event => setStandardId(event.target.value)}><option value="">选择已激活版本</option>{standards.filter(item => item.status === 'active').map(item => <option key={item.id} value={item.id}>{item.name} v{item.version}</option>)}</select></div></div><div className="actions" style={{ marginTop: 14, justifyContent: 'flex-end' }}><button className="btn primary" disabled={!selectedId || !standardId || busy} onClick={() => void start()}>{busy ? <Spinner /> : <Play size={15} />}开始标注</button></div></div></div>
+        <div className="panel"><div className="panel-head"><h2>创建标注运行</h2></div><div className="panel-body"><div className="field-row"><div className="field"><label>当前数据集</label><select className="select" value={selectedId} onChange={event => setSelectedId(event.target.value)}><option value="">选择数据集</option>{datasets.map(item => <option key={item.id} value={item.id}>{item.name} · {item.item_count}</option>)}</select></div><div className="field"><label>Standard</label><select className="select" value={standardId} onChange={event => setStandardId(event.target.value)}><option value="">选择已激活版本</option>{standards.filter(item => item.status === 'active').map(item => <option key={item.id} value={item.id}>{item.name} v{item.version}</option>)}</select></div><div className="field"><label>并行度</label><select className="select" value={concurrency} onChange={event => setConcurrency(Number(event.target.value))}>{[1, 2, 4, 8, 16].map(value => <option key={value} value={value}>{value === 1 ? '1 · 串行' : `${value} 条并行`}</option>)}</select></div></div><div className="hint" style={{ marginTop: 8 }}>并行度越高越快，但会成比例放大千帆请求速率；触发限流时系统会自动退避重试。数据量小或额度紧张时建议保持较低值。</div><div className="actions" style={{ marginTop: 14, justifyContent: 'flex-end' }}><button className="btn primary" disabled={!selectedId || !standardId || busy} onClick={() => void start()}>{busy ? <Spinner /> : <Play size={15} />}开始标注</button></div></div></div>
         <div className="panel"><div className="panel-head"><h2>数据预览</h2><span className="hint">内部 ID 已生成</span></div>{items.length ? <div className="table-wrap" style={{ maxHeight: 470 }}><table><thead><tr><th>ID</th><th>文本</th><th>Gold Label</th></tr></thead><tbody>{items.map(item => <tr key={item.id}><td><span className="rule-chip">{item.id.slice(0, 8)}</span></td><td className="text-cell">{item.text}</td><td>{item.gold_label || '-'}</td></tr>)}</tbody></table></div> : <Empty title="选择数据集查看内容" />}</div>
       </div>
     </div>
@@ -507,13 +508,16 @@ function queryMonitors(items: Array<{ id: string; text: string }>, detail: RunDe
     const started = queryStart ? new Date(queryStart.created_at).getTime() : 0
     const ended = queryEnd ? new Date(queryEnd.created_at).getTime() : Date.now()
     const lastEvent = events[events.length - 1]
-    const stage = annotation ? 'COMPLETED' : lastEvent?.stage || (id === detail.run.current_item_id ? detail.run.current_stage || 'QUERY' : 'QUEUED')
     const completed = Boolean(annotation || queryEnd)
+    // Under parallelism the run has no single current item, so "running" means
+    // this query has emitted events but has not finished yet.
+    const running = !completed && events.length > 0
+    const stage = completed ? 'COMPLETED' : lastEvent?.stage || 'QUEUED'
     const stages = Array.from(new Set(events.filter(event => event.stage !== 'RUN').map(event => event.stage)))
       .sort((a, b) => monitorStageOrder.indexOf(a) - monitorStageOrder.indexOf(b))
     const summaries = aggregateCalls(modelCalls)
     return {
-      id, text: itemText.get(id) || `Item ${id.slice(0, 8)}`, status: completed ? (annotation?.route || 'completed') : id === detail.run.current_item_id ? 'running' : stage === 'QUEUED' ? 'queued' : 'running',
+      id, text: itemText.get(id) || `Item ${id.slice(0, 8)}`, status: completed ? (annotation?.route || 'completed') : running ? 'running' : 'queued',
       stage, route: annotation?.route, label: annotation?.label, decisionStatus: annotation?.decision.status, confidence: annotation?.confidence,
       duration: started ? Math.max(0, ended - started) : null, tokens: summaries.total,
       annotator: summaries.annotator, stages, events, modelCalls,
@@ -524,6 +528,12 @@ function queryMonitors(items: Array<{ id: string; text: string }>, detail: RunDe
   })
 }
 function tokenText(tokens: TokenSummary) { return `输入 ${tokens.input.toLocaleString()} · 输出 ${tokens.output.toLocaleString()} · 缓存 ${tokens.cached.toLocaleString()}` }
+function wallClockDuration(detail: RunDetail | null) {
+  if (!detail) return 0
+  const started = new Date(detail.run.created_at).getTime()
+  const ended = detail.run.completed_at ? new Date(detail.run.completed_at).getTime() : Date.now()
+  return Math.max(0, ended - started)
+}
 function costText(value: number) { return `¥${value.toFixed(4)}` }
 function modelSummaryText(summary: ModelSummary) { return `${summary.calls} 次 · ${ms(summary.duration)} · ${tokenText(summary)} · ${costText(summary.cost)}` }
 
@@ -574,8 +584,8 @@ function RunsPage({ runs, standards, refresh, notify }: { runs: Run[]; standards
             }]
           }
           const run = { ...previous.run }
-          if (trace.stage === 'QUERY' && trace.event_type === 'STAGE_COMPLETED') run.processed = trace.metadata?.index || run.processed
-          if (trace.stage && trace.item_id && ['STAGE_STARTED', 'MODEL_CALL_COMPLETED'].includes(trace.event_type)) { run.current_item_id = trace.item_id; run.current_stage = trace.stage }
+          if (trace.stage === 'QUERY' && trace.event_type === 'STAGE_COMPLETED') run.processed = Math.max(run.processed, Number(trace.metadata?.completed) || run.processed)
+          if (trace.stage && ['STAGE_STARTED', 'MODEL_CALL_COMPLETED'].includes(trace.event_type)) run.current_stage = trace.stage
           return { ...previous, run, events, model_calls: modelCalls }
         })
         if (trace.stage === 'QUERY' && trace.event_type === 'STAGE_COMPLETED') { void loadDetail(); void refresh() }
@@ -590,7 +600,10 @@ function RunsPage({ runs, standards, refresh, notify }: { runs: Run[]; standards
   const filtered = detail?.annotations.filter(item => filter === 'ALL' || item.route === filter) || []
   const monitors = useMemo(() => queryMonitors(items, detail), [items, detail])
   const runTokens = monitors.reduce<TokenSummary>((sum, item) => ({ input: sum.input + item.tokens.input, output: sum.output + item.tokens.output, total: sum.total + item.tokens.total, cached: sum.cached + item.tokens.cached, reasoning: sum.reasoning + item.tokens.reasoning, cost: sum.cost + item.tokens.cost }), emptyTokenSummary())
-  const runDuration = monitors.reduce((sum, item) => sum + (item.duration || 0), 0)
+  // Summing per-query durations overstates a parallel run, so the headline
+  // figure is wall clock and the sum is reported separately as cumulative time.
+  const runDuration = wallClockDuration(detail)
+  const cumulativeDuration = monitors.reduce((sum, item) => sum + (item.duration || 0), 0)
   const annotationCallSummary = annotation ? aggregateCalls((detail?.model_calls || []).filter(call => call.item_id === annotation.item_id)) : null
   const candidatePaths = annotation?.disclosure.candidates || annotation?.disclosure.definitions.map(item => item.leaf_path) || []
   const reviewStandard = detail ? standards.find(item => item.id === detail.run.standard_id) : undefined
@@ -598,7 +611,7 @@ function RunsPage({ runs, standards, refresh, notify }: { runs: Run[]; standards
     <PageHead title="标注运行" meta={`${runs.length} 次运行`}><select className="select run-selector" aria-label="选择标注运行" title="选择标注运行" value={selectedId} onChange={event => setSelectedId(event.target.value)} disabled={!runs.length}><option value="">选择运行</option>{runs.map(run => <option key={run.id} value={run.id}>{run.dataset_name} · v{run.standard_version} · {run.status}</option>)}</select>{detail?.run.status === 'completed' && <><a className="btn" href={`/api/runs/${detail.run.id}/export?format=csv`}><Upload size={15} style={{ transform: 'rotate(180deg)' }} />导出结果</a><a className="btn" href={`/api/runs/${detail.run.id}/export?format=jsonl&gold_only=true`}><ShieldCheck size={15} />导出 Gold</a></>}{detail?.run.status === 'failed' && <button className="btn primary" disabled={retrying} onClick={() => void retry()}>{retrying ? <Spinner /> : <Play size={15} />}继续运行</button>}<button className="btn" onClick={() => void refresh()}><RefreshCw size={15} />刷新</button></PageHead>
     <div className="run-detail-layout">{detail ? <>
         <div className="four-col"><div className="metric"><div className="metric-label">自动通过率</div><div className="metric-value">{pct(detail.metrics.auto_accept_rate)}</div></div><div className="metric"><div className="metric-label">准确率</div><div className="metric-value">{pct(detail.metrics.accuracy)}</div><div className="metric-foot">n={detail.metrics.accuracy_sample_size}</div></div><div className="metric"><div className="metric-label">审核率</div><div className="metric-value">{pct(detail.metrics.review_rate)}</div></div><div className="metric"><div className="metric-label">人工反馈</div><div className="metric-value">{detail.metrics.routes.REVIEW || 0}</div></div></div>
-        <QueryMonitorPanel monitors={monitors} run={detail.run} runTokens={runTokens} runDuration={runDuration} />
+        <QueryMonitorPanel monitors={monitors} run={detail.run} runTokens={runTokens} runDuration={runDuration} cumulativeDuration={cumulativeDuration} />
         <div className="panel"><div className="panel-head"><h2>标注结果</h2><select className="select" style={{ width: 155 }} value={filter} onChange={event => setFilter(event.target.value as Route | 'ALL')}><option value="ALL">全部路由</option>{['AUTO_ACCEPT', 'REVIEW'].map(value => <option key={value}>{value}</option>)}</select></div>{filtered.length ? <div className="table-wrap" style={{ maxHeight: 620 }}><table><thead><tr><th>文本</th><th>Label</th><th>Rules</th><th>置信度</th><th>路由</th><th></th></tr></thead><tbody>{filtered.map(item => <tr key={item.id}><td className="text-cell">{item.text}</td><td>{item.human_label || item.label || '-'}</td><td><div className="rules">{item.rules_used.map(rule => <span className="rule-chip" key={rule}>{rule}</span>)}</div></td><td className="confidence">{item.confidence.toFixed(2)}</td><td><Badge value={item.route} className={item.route === 'REVIEW' && Boolean(item.human_label) ? 'reviewed' : ''} /></td><td><button className="btn icon ghost" title="查看" onClick={() => { setAnnotation(item); setReviewLabel(item.human_label || item.label || ''); setReviewNote(item.review_note || '') }}><ChevronRight size={15} /></button></td></tr>)}</tbody></table></div> : <Empty title={detail.run.status === 'completed' ? '没有匹配的标注结果' : '运行处理中'} />}</div>
       </> : <Empty title="选择一次运行" />}
     </div>
@@ -672,10 +685,11 @@ function HierarchicalLabelPicker({ standard, value, onChange }: { standard?: Sta
   return <div className="label-picker"><div className="label-picker-levels">{levels}</div><div className={`hint ${value ? 'label-picker-value' : ''}`}>{value ? `已选叶子标签：${value}` : '请按层级选择，只有叶子标签可以保存审核'}</div></div>
 }
 
-function QueryMonitorPanel({ monitors, run, runTokens, runDuration }: { monitors: QueryMonitor[]; run: Run; runTokens: TokenSummary; runDuration: number }) {
-  const current = monitors.find(item => item.id === run.current_item_id)
+function QueryMonitorPanel({ monitors, run, runTokens, runDuration, cumulativeDuration }: { monitors: QueryMonitor[]; run: Run; runTokens: TokenSummary; runDuration: number; cumulativeDuration: number }) {
+  const running = monitors.filter(item => item.status === 'running')
+  const concurrency = run.concurrency || 1
   return <div className="panel monitor-panel">
-    <div className="panel-head"><div><h2>标注进度</h2><div className="list-meta"><Badge value={run.current_stage || run.status} />{current && <span>当前：{current.text.slice(0, 42)}{current.text.length > 42 ? '…' : ''}</span>}<span>{monitors.length}/{run.total} 条</span></div></div><div className="monitor-total monitor-total-table"><div className="monitor-total-row monitor-total-head"><span>标注总耗时</span><span>输入 Token</span><span>输出 Token</span><span>缓存 Token</span><span>费用</span></div><div className="monitor-total-row monitor-total-values"><strong>{ms(runDuration)}</strong><strong>{runTokens.input.toLocaleString()}</strong><strong>{runTokens.output.toLocaleString()}</strong><strong>{runTokens.cached.toLocaleString()}</strong><strong>{costText(runTokens.cost)}</strong></div></div></div>
+    <div className="panel-head"><div><h2>标注进度</h2><div className="list-meta"><Badge value={run.current_stage || run.status} />{concurrency > 1 && <span>并行度 {concurrency}</span>}{running.length === 1 ? <span>当前：{running[0].text.slice(0, 42)}{running[0].text.length > 42 ? '…' : ''}</span> : running.length > 1 ? <span>{running.length} 条并行处理中</span> : null}<span>{run.processed}/{run.total} 条</span></div></div><div className="monitor-total monitor-total-table"><div className="monitor-total-row monitor-total-head"><span>标注总耗时</span><span>累计模型耗时</span><span>输入 Token</span><span>输出 Token</span><span>缓存 Token</span><span>费用</span></div><div className="monitor-total-row monitor-total-values"><strong>{ms(runDuration)}</strong><strong>{ms(cumulativeDuration)}</strong><strong>{runTokens.input.toLocaleString()}</strong><strong>{runTokens.output.toLocaleString()}</strong><strong>{runTokens.cached.toLocaleString()}</strong><strong>{costText(runTokens.cost)}</strong></div></div></div>
     {monitors.length ? <div className="query-monitor-list"><div className="query-monitor-head"><span>文本</span><span>标注标签</span><span>路由 / 进度</span><span>耗时</span><span>Token</span><span>费用</span><span /></div>{monitors.map(item => <details className="query-monitor" key={item.id}>
       <summary className="query-monitor-summary">
         <span className="query-monitor-text" title={item.text}>{item.text}</span>

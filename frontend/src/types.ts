@@ -79,10 +79,12 @@ export interface Run {
   status: 'queued' | 'running' | 'completed' | 'failed'
   total: number
   processed: number
+  concurrency?: number
   current_item_id?: string
   current_stage?: string
   error?: string
   created_at: string
+  completed_at?: string
 }
 export interface TraceEvent {
   id: string

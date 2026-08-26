@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
 import time
 from contextlib import asynccontextmanager, nullcontext
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .annotator import annotate
 from .compiler import CompilerSource, compile_sources
@@ -16,11 +17,12 @@ from .domain import (
     CompiledStandard,
     DecisionStatus,
     DisclosureTrace,
+    ModelSettings,
 )
 from .documents import ParsedDocument, parse_standard_document
 from .provider import QianfanProvider
 from .router import route_annotation
-from .store import Store, utc_now
+from .store import Store, normalize_concurrency, utc_now
 from .taxonomy import descendants, label_path, parse_compiled_standard, upgrade_compiled_payload
 from .validator import validate_standard
 from .yaml_io import standard_to_yaml_files
@@ -33,6 +35,9 @@ class LabelSpecService:
         self.store = store
         self.provider = provider
         self.disclosure = DisclosureEngine(provider, store)
+        # Parallel runs have no single "current" query, so events must not
+        # overwrite the run pointer. Track the parallelism per active run.
+        self._run_concurrency: Dict[str, int] = {}
         set_observer = getattr(provider, "set_call_observer", None)
         if set_observer:
             set_observer(self.record_model_call)
@@ -99,9 +104,13 @@ class LabelSpecService:
             metadata=metadata,
         )
         if event_type in {"STAGE_STARTED", "MODEL_CALL_COMPLETED"}:
+            # With more than one worker the pointer would thrash between
+            # interleaved queries, so parallel runs only publish the stage and
+            # let the UI derive the in-flight set from per-item events.
+            parallel = self._run_concurrency.get(run_id, 1) > 1
             self.store.update_run(
                 run_id,
-                current_item_id=item_id,
+                current_item_id=None if parallel else item_id,
                 current_stage=stage,
             )
         return event
@@ -257,6 +266,10 @@ class LabelSpecService:
         }
         pending_items = [item for item in items if item["id"] not in completed_item_ids]
         completed_count = len(completed_item_ids)
+        concurrency = normalize_concurrency(run.get("concurrency", 1))
+        # Never start more workers than there is work for them to do.
+        workers = max(1, min(concurrency, len(pending_items) or 1))
+        self._run_concurrency[run_id] = concurrency
         self.store.update_run(
             run_id,
             status="running",
@@ -265,160 +278,22 @@ class LabelSpecService:
             completed_at=None,
         )
         try:
-            for index, item in enumerate(pending_items, start=completed_count + 1):
+            if concurrency > 1:
                 await self._emit_event(
-                    run_id, item["id"], "QUERY", "STAGE_STARTED", "running",
-                    f"开始处理第 {index}/{len(items)} 条 query",
-                    metadata={"index": index, "total": len(items)},
+                    run_id, None, "RUN", "STAGE_STARTED", "running",
+                    f"以并行度 {workers} 处理 {len(pending_items)} 条待标注 query",
+                    metadata={
+                        "concurrency": concurrency,
+                        "workers": workers,
+                        "pending": len(pending_items),
+                        "total": len(items),
+                    },
                 )
-                async with self._trace_stage(
-                    run_id, item["id"], "DISCLOSURE", "候选召回开始",
-                    model_role="annotator", model_id=settings.annotator_model,
-                ):
-                    trace = await self.disclosure.disclose(
-                        text=item["text"],
-                        item_id=item["id"],
-                        standard=standard,
-                        model=settings.annotator_model,
-                        embedding_model=settings.embedding_model,
-                    )
-                async with self._trace_stage(
-                    run_id, item["id"], "ANNOTATOR", "Annotator 开始决策",
-                    model_role="annotator", model_id=settings.annotator_model,
-                ):
-                    try:
-                        decision = await annotate(
-                            self.provider, settings.annotator_model, item["text"], trace
-                        )
-                    except Exception as exc:
-                        decision = self._fallback_decision(trace, f"Annotator 输出无法解析：{exc}")
-                # Legacy models may still request historical context. New
-                # annotators express this as needs_review and do not retry.
-                if decision.status == DecisionStatus.needs_context:
-                    historical_cases = await self.disclosure.retrieve_history(
-                        item["text"], item["id"], trace.candidates,
-                        settings.embedding_model,
-                    )
-                    if historical_cases:
-                        trace.historical_cases = historical_cases
-                        try:
-                            decision = await annotate(
-                                self.provider, settings.annotator_model, item["text"], trace
-                            )
-                        except Exception as exc:
-                            decision = self._fallback_decision(trace, f"历史 Case 重试输出无法解析：{exc}")
-                try:
-                    decision = AnnotationDecision.model_validate(decision.model_dump())
-                except Exception as exc:
-                    decision = self._fallback_decision(trace, f"Annotator 输出不符合结构：{exc}")
-                if decision.status != DecisionStatus.labeled:
-                    decision = decision.model_copy(update={
-                        "status": DecisionStatus.labeled,
-                        "needs_review": True,
-                        "review_reason_codes": list(dict.fromkeys([
-                            *decision.review_reason_codes, decision.status.value
-                        ])),
-                        "reason": (
-                            decision.reason
-                            + f"（模型标记为 {decision.status.value}，因此需要人工确认。）"
-                        ),
-                    })
-                async with self._trace_stage(
-                    run_id, item["id"], "ANNOTATOR_VALIDATE", "校验 Annotator 输出一致性",
-                    model_role="annotator", model_id=settings.annotator_model,
-                ):
-                    decision = await self._ensure_valid_decision(
-                        settings.annotator_model, item["text"], trace, decision
-                    )
-                known_rule_ids = {
-                    rule.rule_id
-                    for chain in trace.definitions
-                    for rule in chain.chain
-                } | {
-                    rule.rule_id for rule in [*trace.boundaries, *trace.global_priority_rules]
-                }
-                unsupported = sorted(set(decision.rules_used) - known_rule_ids)
-                if unsupported:
-                    decision = decision.model_copy(update={
-                        "decision_rules_referenced": [
-                            rule_id for rule_id in decision.decision_rules_referenced
-                            if rule_id in known_rule_ids
-                        ],
-                        "needs_review": True,
-                        "review_reason_codes": list(dict.fromkeys([
-                            *decision.review_reason_codes, "INVALID_RULE_REFERENCE"
-                        ])),
-                        "reason": (
-                            f"模型引用了未披露的规则 {', '.join(unsupported)}，"
-                            "标签仍然来自合法候选，但需要人工确认。"
-                        ),
-                        "status": DecisionStatus.labeled,
-                    })
-                selected_chain = next(
-                    (chain for chain in trace.definitions if chain.leaf_path == decision.label),
-                    None,
-                )
-                if selected_chain is None:
-                    # This should only be reachable after a malformed model
-                    # response. _ensure_valid_decision chooses the first legal
-                    # candidate, but keep a final guard before persistence.
-                    selected_chain = trace.definitions[0] if trace.definitions else None
-                    if selected_chain is None:
-                        raise ValueError("Disclosure 未返回任何合法叶子标签")
-                    decision = decision.model_copy(update={
-                        "status": DecisionStatus.labeled,
-                        "label": selected_chain.leaf_path,
-                        "leaf_rule_used": selected_chain.chain[-1].rule_id,
-                        "needs_review": True,
-                        "review_reason_codes": list(dict.fromkeys([
-                            *decision.review_reason_codes, "INVALID_LABEL"
-                        ])),
-                        "reason": "模型标签不在合法候选范围内，系统选择第一个合法候选，需人工确认。",
-                        "confidence": 0.0,
-                    })
-                definition_rules = [
-                    rule.rule_id for rule in selected_chain.chain
-                ]
-                rules_used = list(
-                    dict.fromkeys([*definition_rules, *decision.decision_rules_referenced])
-                )
-                if decision.needs_review or decision.confidence < settings.auto_accept_threshold:
-                    decision = self._attach_review_evidence(
-                        decision,
-                        selected_chain,
-                        trace,
-                        low_confidence=decision.confidence < settings.auto_accept_threshold,
-                    )
-                async with self._trace_stage(
-                    run_id, item["id"], "ROUTER", "根据标签合法性和审核信号路由",
-                ):
-                    route, reasons = route_annotation(
-                        decision, threshold=settings.auto_accept_threshold
-                    )
-                result = AnnotationResult(
-                    item_id=item["id"],
-                    text=item["text"],
-                    label=decision.label,
-                    candidates=trace.candidates,
-                    rules_used=rules_used,
-                    rule_reasons=decision.rule_reasons,
-                    evidence=decision.evidence,
-                    confidence=decision.confidence,
-                    route=route,
-                    route_reasons=reasons,
-                    decision=decision,
-                    disclosure=trace,
-                )
-                async with self._trace_stage(
-                    run_id, item["id"], "PERSIST", "保存 query 标注结果",
-                ):
-                    self.store.save_annotation(run_id, result.model_dump(mode="json"))
-                self.store.update_run(run_id, processed=index)
-                await self._emit_event(
-                    run_id, item["id"], "QUERY", "STAGE_COMPLETED", "success",
-                    f"第 {index}/{len(items)} 条 query 处理完成",
-                    metadata={"index": index, "total": len(items), "route": route.value},
-                )
+            await self._run_workers(
+                run_id, pending_items, standard, settings,
+                total=len(items), already_completed=completed_count,
+                workers=workers,
+            )
             await self._emit_event(
                 run_id, None, "RUN", "STAGE_COMPLETED", "success", "标注运行完成",
                 metadata={"processed": len(items), "total": len(items)},
@@ -437,6 +312,226 @@ class LabelSpecService:
                 run_id, status="failed", current_stage="FAILED",
                 error=str(exc), completed_at=utc_now(),
             )
+        finally:
+            self._run_concurrency.pop(run_id, None)
+
+    async def _run_workers(
+        self,
+        run_id: str,
+        pending_items: Sequence[Dict[str, Any]],
+        standard: CompiledStandard,
+        settings: ModelSettings,
+        total: int,
+        already_completed: int,
+        workers: int,
+    ) -> None:
+        """Drain the pending queue with a bounded worker pool.
+
+        The first failure aborts the run: remaining queue entries are dropped and
+        sibling workers are cancelled so that no task keeps writing annotations
+        into a run that is about to be marked failed.
+        """
+        queue: asyncio.Queue = asyncio.Queue()
+        for item in pending_items:
+            queue.put_nowait(item)
+        # A plain int would be rebound rather than shared, so keep the completion
+        # counter in a mutable cell guarded by the single-threaded event loop.
+        progress = {"completed": already_completed}
+        failure: List[BaseException] = []
+
+        async def worker() -> None:
+            while not failure:
+                try:
+                    item = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    await self._process_item(
+                        run_id, item, standard, settings, total, progress
+                    )
+                except BaseException as exc:  # noqa: BLE001 - re-raised by caller
+                    failure.append(exc)
+                    return
+                finally:
+                    queue.task_done()
+
+        tasks = [asyncio.ensure_future(worker()) for _ in range(workers)]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if failure:
+            raise failure[0]
+
+    async def _process_item(
+        self,
+        run_id: str,
+        item: Dict[str, Any],
+        standard: CompiledStandard,
+        settings: ModelSettings,
+        total: int,
+        progress: Dict[str, int],
+    ) -> None:
+        """Annotate one query end to end and persist its result."""
+        await self._emit_event(
+            run_id, item["id"], "QUERY", "STAGE_STARTED", "running",
+            "开始处理 query",
+            metadata={"total": total},
+        )
+        async with self._trace_stage(
+            run_id, item["id"], "DISCLOSURE", "候选召回开始",
+            model_role="annotator", model_id=settings.annotator_model,
+        ):
+            trace = await self.disclosure.disclose(
+                text=item["text"],
+                item_id=item["id"],
+                standard=standard,
+                model=settings.annotator_model,
+                embedding_model=settings.embedding_model,
+            )
+        async with self._trace_stage(
+            run_id, item["id"], "ANNOTATOR", "Annotator 开始决策",
+            model_role="annotator", model_id=settings.annotator_model,
+        ):
+            try:
+                decision = await annotate(
+                    self.provider, settings.annotator_model, item["text"], trace
+                )
+            except Exception as exc:
+                decision = self._fallback_decision(trace, f"Annotator 输出无法解析：{exc}")
+        # Legacy models may still request historical context. New
+        # annotators express this as needs_review and do not retry.
+        if decision.status == DecisionStatus.needs_context:
+            historical_cases = await self.disclosure.retrieve_history(
+                item["text"], item["id"], trace.candidates,
+                settings.embedding_model,
+            )
+            if historical_cases:
+                trace.historical_cases = historical_cases
+                try:
+                    decision = await annotate(
+                        self.provider, settings.annotator_model, item["text"], trace
+                    )
+                except Exception as exc:
+                    decision = self._fallback_decision(trace, f"历史 Case 重试输出无法解析：{exc}")
+        try:
+            decision = AnnotationDecision.model_validate(decision.model_dump())
+        except Exception as exc:
+            decision = self._fallback_decision(trace, f"Annotator 输出不符合结构：{exc}")
+        if decision.status != DecisionStatus.labeled:
+            decision = decision.model_copy(update={
+                "status": DecisionStatus.labeled,
+                "needs_review": True,
+                "review_reason_codes": list(dict.fromkeys([
+                    *decision.review_reason_codes, decision.status.value
+                ])),
+                "reason": (
+                    decision.reason
+                    + f"（模型标记为 {decision.status.value}，因此需要人工确认。）"
+                ),
+            })
+        async with self._trace_stage(
+            run_id, item["id"], "ANNOTATOR_VALIDATE", "校验 Annotator 输出一致性",
+            model_role="annotator", model_id=settings.annotator_model,
+        ):
+            decision = await self._ensure_valid_decision(
+                settings.annotator_model, item["text"], trace, decision
+            )
+        known_rule_ids = {
+            rule.rule_id
+            for chain in trace.definitions
+            for rule in chain.chain
+        } | {
+            rule.rule_id for rule in [*trace.boundaries, *trace.global_priority_rules]
+        }
+        unsupported = sorted(set(decision.rules_used) - known_rule_ids)
+        if unsupported:
+            decision = decision.model_copy(update={
+                "decision_rules_referenced": [
+                    rule_id for rule_id in decision.decision_rules_referenced
+                    if rule_id in known_rule_ids
+                ],
+                "needs_review": True,
+                "review_reason_codes": list(dict.fromkeys([
+                    *decision.review_reason_codes, "INVALID_RULE_REFERENCE"
+                ])),
+                "reason": (
+                    f"模型引用了未披露的规则 {', '.join(unsupported)}，"
+                    "标签仍然来自合法候选，但需要人工确认。"
+                ),
+                "status": DecisionStatus.labeled,
+            })
+        selected_chain = next(
+            (chain for chain in trace.definitions if chain.leaf_path == decision.label),
+            None,
+        )
+        if selected_chain is None:
+            # This should only be reachable after a malformed model
+            # response. _ensure_valid_decision chooses the first legal
+            # candidate, but keep a final guard before persistence.
+            selected_chain = trace.definitions[0] if trace.definitions else None
+            if selected_chain is None:
+                raise ValueError("Disclosure 未返回任何合法叶子标签")
+            decision = decision.model_copy(update={
+                "status": DecisionStatus.labeled,
+                "label": selected_chain.leaf_path,
+                "leaf_rule_used": selected_chain.chain[-1].rule_id,
+                "needs_review": True,
+                "review_reason_codes": list(dict.fromkeys([
+                    *decision.review_reason_codes, "INVALID_LABEL"
+                ])),
+                "reason": "模型标签不在合法候选范围内，系统选择第一个合法候选，需人工确认。",
+                "confidence": 0.0,
+            })
+        definition_rules = [
+            rule.rule_id for rule in selected_chain.chain
+        ]
+        rules_used = list(
+            dict.fromkeys([*definition_rules, *decision.decision_rules_referenced])
+        )
+        if decision.needs_review or decision.confidence < settings.auto_accept_threshold:
+            decision = self._attach_review_evidence(
+                decision,
+                selected_chain,
+                trace,
+                low_confidence=decision.confidence < settings.auto_accept_threshold,
+            )
+        async with self._trace_stage(
+            run_id, item["id"], "ROUTER", "根据标签合法性和审核信号路由",
+        ):
+            route, reasons = route_annotation(
+                decision, threshold=settings.auto_accept_threshold
+            )
+        result = AnnotationResult(
+            item_id=item["id"],
+            text=item["text"],
+            label=decision.label,
+            candidates=trace.candidates,
+            rules_used=rules_used,
+            rule_reasons=decision.rule_reasons,
+            evidence=decision.evidence,
+            confidence=decision.confidence,
+            route=route,
+            route_reasons=reasons,
+            decision=decision,
+            disclosure=trace,
+        )
+        async with self._trace_stage(
+            run_id, item["id"], "PERSIST", "保存 query 标注结果",
+        ):
+            self.store.save_annotation(run_id, result.model_dump(mode="json"))
+        # Ordering is nondeterministic under parallelism, so progress counts
+        # completions rather than a loop index.
+        progress["completed"] += 1
+        completed = progress["completed"]
+        self.store.update_run(run_id, processed=completed)
+        await self._emit_event(
+            run_id, item["id"], "QUERY", "STAGE_COMPLETED", "success",
+            f"query 处理完成（{completed}/{total}）",
+            metadata={"completed": completed, "total": total, "route": route.value},
+        )
 
     async def _ensure_valid_decision(
         self,
@@ -842,6 +937,7 @@ class LabelSpecService:
         target_standard_id: str,
         rule_id: str,
         labels: List[str],
+        concurrency: Optional[int] = None,
     ) -> Dict[str, Any]:
         source = self.store.get_run(source_run_id)
         item_ids = self.store.affected_item_ids(source_run_id, rule_id, labels)
@@ -850,4 +946,6 @@ class LabelSpecService:
             standard_id=target_standard_id,
             scope_item_ids=item_ids,
             parent_run_id=source_run_id,
+            # Impact reruns default to the parallelism the source run used.
+            concurrency=source.get("concurrency", 1) if concurrency is None else concurrency,
         )

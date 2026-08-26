@@ -17,6 +17,7 @@ from .api import app as api_app
 from .api import miner, provider, service, store
 from .domain import ModelSettings
 from .documents import parse_standard_document
+from .store import MAX_RUN_CONCURRENCY
 from .taxonomy import parse_compiled_standard
 from .validator import validate_standard
 from .yaml_io import standard_to_yaml_files
@@ -136,10 +137,17 @@ def import_data_command(path: Path = typer.Argument(..., exists=True), name: Opt
 
 
 @app.command("annotate")
-def annotate_command(dataset_id: str, standard_id: str) -> None:
+def annotate_command(
+    dataset_id: str,
+    standard_id: str,
+    concurrency: int = typer.Option(
+        1, "--concurrency", "-c", min=1, max=MAX_RUN_CONCURRENCY,
+        help="Number of queries annotated in parallel.",
+    ),
+) -> None:
     """Run progressive-disclosure annotation synchronously."""
     store.initialize()
-    run = store.create_run(dataset_id, standard_id)
+    run = store.create_run(dataset_id, standard_id, concurrency=concurrency)
     asyncio.run(service.process_run(run["id"]))
     console.print_json(data={"run": store.get_run(run["id"]), "metrics": store.run_metrics(run["id"])})
 
@@ -148,11 +156,12 @@ def annotate_command(dataset_id: str, standard_id: str) -> None:
 def runs_command() -> None:
     """List annotation runs."""
     store.initialize()
-    table = Table("Run", "Dataset", "Standard", "Status", "Progress")
+    table = Table("Run", "Dataset", "Standard", "Status", "Progress", "Parallel")
     for run in store.list_runs():
         table.add_row(
             run["id"], run["dataset_name"], f"{run['standard_name']} v{run['standard_version']}",
             run["status"], f"{run['processed']}/{run['total']}",
+            str(run.get("concurrency", 1)),
         )
     console.print(table)
 
@@ -192,6 +201,10 @@ def impact_rerun_command(
     target_standard_id: str,
     rule_id: str,
     labels: str = typer.Option("", help="Comma-separated labels affected by the Rule"),
+    concurrency: Optional[int] = typer.Option(
+        None, "--concurrency", "-c", min=1, max=MAX_RUN_CONCURRENCY,
+        help="Queries annotated in parallel; defaults to the source run's value.",
+    ),
 ) -> None:
     """Re-annotate only cases impacted by a Rule change."""
     store.initialize()
@@ -200,6 +213,7 @@ def impact_rerun_command(
         target_standard_id,
         rule_id,
         [label.strip() for label in labels.split(",") if label.strip()],
+        concurrency,
     )
     asyncio.run(service.process_run(run["id"]))
     console.print_json(data={"run": store.get_run(run["id"]), "metrics": store.run_metrics(run["id"])})

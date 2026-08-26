@@ -22,7 +22,7 @@ from .domain import ModelSettings
 from .miner import SpecGapMiner
 from .provider import MissingApiKeyError, ProviderError, QianfanProvider
 from .service import LabelSpecService
-from .store import DatasetDeleteError, StandardDeleteError, Store
+from .store import MAX_RUN_CONCURRENCY, DatasetDeleteError, StandardDeleteError, Store
 from .validator import validate_standard
 from .yaml_io import standard_to_yaml_files
 from .taxonomy import parse_compiled_standard
@@ -64,6 +64,7 @@ class CompileRequest(BaseModel):
 class RunRequest(BaseModel):
     dataset_id: str
     standard_id: str
+    concurrency: int = Field(default=1, ge=1, le=MAX_RUN_CONCURRENCY)
 
 
 class ReviewRequest(BaseModel):
@@ -99,6 +100,7 @@ class ImpactRunRequest(BaseModel):
     target_standard_id: str
     rule_id: str
     labels: List[str] = Field(default_factory=list)
+    concurrency: Optional[int] = Field(default=None, ge=1, le=MAX_RUN_CONCURRENCY)
 
 
 def _handle_error(exc: Exception) -> HTTPException:
@@ -439,7 +441,9 @@ def create_run(payload: RunRequest, background_tasks: BackgroundTasks) -> Dict[s
         if standard["status"] != "active":
             raise ValueError("只能使用已激活的 Standard 运行标注")
         store.get_dataset(payload.dataset_id)
-        run = store.create_run(payload.dataset_id, payload.standard_id)
+        run = store.create_run(
+            payload.dataset_id, payload.standard_id, concurrency=payload.concurrency
+        )
         background_tasks.add_task(service.process_run, run["id"])
         return run
     except Exception as exc:
@@ -452,12 +456,22 @@ def runs() -> List[Dict[str, Any]]:
 
 
 @app.post("/api/runs/{run_id}/retry")
-def retry_run(run_id: str, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+def retry_run(
+    run_id: str,
+    background_tasks: BackgroundTasks,
+    concurrency: Optional[int] = None,
+) -> Dict[str, Any]:
     try:
         run = store.get_run(run_id)
         if run["status"] != "failed":
             raise ValueError("只能继续失败的运行")
-        store.update_run(run_id, status="queued", error=None, completed_at=None)
+        # Continuing keeps the original parallelism unless the caller overrides it.
+        updates: Dict[str, Any] = {"status": "queued", "error": None, "completed_at": None}
+        if concurrency is not None:
+            if not 1 <= concurrency <= MAX_RUN_CONCURRENCY:
+                raise ValueError(f"并行度必须在 1 到 {MAX_RUN_CONCURRENCY} 之间")
+            updates["concurrency"] = concurrency
+        store.update_run(run_id, **updates)
         background_tasks.add_task(service.process_run, run_id)
         return store.get_run(run_id)
     except Exception as exc:
@@ -681,6 +695,7 @@ def impact_run(payload: ImpactRunRequest, background_tasks: BackgroundTasks) -> 
             payload.target_standard_id,
             payload.rule_id,
             payload.labels,
+            payload.concurrency,
         )
         background_tasks.add_task(service.process_run, run["id"])
         return run

@@ -82,7 +82,7 @@ labelspec settings
 labelspec compile standard.md supplemental-boundaries.docx --name "客户意图" --output-dir ./compiled
 labelspec activate <standard-id>
 labelspec import-data cases.csv
-labelspec annotate <dataset-id> <standard-id>
+labelspec annotate <dataset-id> <standard-id> --concurrency 4
 labelspec mine <run-id>
 labelspec revise <standard-id> <rule-id> edited-rule.json --reason "人工确认的修改"
 labelspec impact-rerun <source-run-id> <target-standard-id> <rule-id>

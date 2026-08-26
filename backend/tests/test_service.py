@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Type
+import asyncio
+from typing import List, Type
 
 import pytest
 from pydantic import BaseModel
@@ -156,6 +157,39 @@ class SpecGapProvider(TestProvider):
         if response_model.__name__ == "VerificationDecision":
             self.verifier_calls += 1
         return result
+
+
+class ConcurrencyTrackingProvider(TestProvider):
+    """Records how many structured calls overlap, to prove the pool is bounded."""
+
+    def __init__(self, delay: float = 0.01) -> None:
+        self.delay = delay
+        self.in_flight = 0
+        self.peak_in_flight = 0
+
+    async def structured(self, model, system, user, response_model, temperature=0):
+        self.in_flight += 1
+        self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
+        try:
+            await asyncio.sleep(self.delay)
+            return await super().structured(model, system, user, response_model, temperature)
+        finally:
+            self.in_flight -= 1
+
+
+class FailOnTextProvider(TestProvider):
+    """Fails the query whose text is `marker`, leaving siblings to succeed."""
+
+    def __init__(self, marker: str) -> None:
+        self.marker = marker
+        self.seen_texts: List[str] = []
+
+    async def structured(self, model, system, user, response_model, temperature=0):
+        if response_model.__name__ == "CandidateDecision":
+            self.seen_texts.append(user)
+            if self.marker in user:
+                raise ValueError(f"模拟 {self.marker} 处理失败")
+        return await super().structured(model, system, user, response_model, temperature)
 
 
 def test_candidate_normalization_strips_explanation_suffix() -> None:
@@ -331,3 +365,102 @@ async def test_non_labeled_decision_skips_verifier(store) -> None:
     assert annotation["label"] == "金融/贷款"
     assert annotation["verifier"]["outcome"] == "SKIPPED"
     assert annotation["route_reasons"][0]["code"] == "INVALID_ANNOTATOR_OUTPUT"
+
+
+@pytest.mark.asyncio
+async def test_parallel_run_annotates_every_item_and_counts_completions(store) -> None:
+    current = store.create_standard("source", standard(), status="active")
+    dataset = store.create_dataset(
+        "cases", "cases.csv",
+        [{"text": f"第{index}条贷款利率", "gold_label": "金融/贷款"} for index in range(9)],
+    )
+    run = store.create_run(dataset["id"], current["id"], concurrency=4)
+    provider = ConcurrencyTrackingProvider()
+
+    await LabelSpecService(store, provider).process_run(run["id"])
+
+    completed = store.get_run(run["id"])
+    assert completed["status"] == "completed"
+    assert completed["processed"] == 9
+    assert completed["concurrency"] == 4
+    annotations = store.list_annotations(run["id"])
+    assert len({annotation["item_id"] for annotation in annotations}) == 9
+    # Progress is a shared completion counter, so it must be a clean 1..9 sequence.
+    counts = [
+        event["metadata"]["completed"]
+        for event in store.list_annotation_events(run["id"])
+        if event["stage"] == "QUERY" and event["event_type"] == "STAGE_COMPLETED"
+    ]
+    assert sorted(counts) == list(range(1, 10))
+    assert provider.peak_in_flight > 1
+
+
+@pytest.mark.asyncio
+async def test_worker_pool_never_exceeds_requested_concurrency(store) -> None:
+    current = store.create_standard("source", standard(), status="active")
+    dataset = store.create_dataset(
+        "cases", "cases.csv",
+        [{"text": f"第{index}条贷款利率"} for index in range(8)],
+    )
+    run = store.create_run(dataset["id"], current["id"], concurrency=2)
+    provider = ConcurrencyTrackingProvider()
+
+    await LabelSpecService(store, provider).process_run(run["id"])
+
+    assert store.get_run(run["id"])["status"] == "completed"
+    assert provider.peak_in_flight == 2
+
+
+@pytest.mark.asyncio
+async def test_parallel_run_stops_writing_after_a_failure_and_resumes(store) -> None:
+    current = store.create_standard("source", standard(), status="active")
+    dataset = store.create_dataset(
+        "cases", "cases.csv",
+        [{"text": f"第{index}条贷款利率"} for index in range(6)],
+    )
+    run = store.create_run(dataset["id"], current["id"], concurrency=3)
+
+    await LabelSpecService(store, FailOnTextProvider("第4条")).process_run(run["id"])
+
+    failed = store.get_run(run["id"])
+    partial = store.list_annotations(run["id"])
+    assert failed["status"] == "failed"
+    # The failing query is never annotated, and siblings cancelled mid-flight
+    # must not have written a partial annotation either.
+    assert len(partial) < 6
+    assert all("第4条" not in annotation["text"] for annotation in partial)
+
+    retry_provider = ConcurrencyTrackingProvider()
+    await LabelSpecService(store, retry_provider).process_run(run["id"])
+
+    completed = store.get_run(run["id"])
+    annotations = store.list_annotations(run["id"])
+    assert completed["status"] == "completed"
+    assert completed["processed"] == 6
+    assert len({annotation["item_id"] for annotation in annotations}) == 6
+
+
+@pytest.mark.asyncio
+async def test_parallel_run_does_not_publish_a_single_current_item(store) -> None:
+    current = store.create_standard("source", standard(), status="active")
+    dataset = store.create_dataset(
+        "cases", "cases.csv", [{"text": f"第{index}条贷款利率"} for index in range(4)]
+    )
+    serial = store.create_run(dataset["id"], current["id"], concurrency=1)
+    service = LabelSpecService(store, TestProvider())
+
+    await service.process_run(serial["id"])
+    serial_pointers = {
+        event["item_id"]
+        for event in store.list_annotation_events(serial["id"])
+        if event["event_type"] == "STAGE_STARTED"
+    }
+    assert serial_pointers - {None}
+
+    parallel = store.create_run(dataset["id"], current["id"], concurrency=4)
+    await service.process_run(parallel["id"])
+
+    # Concurrency > 1 suppresses the run pointer so the UI derives the
+    # in-flight set from per-item events instead of a thrashing single value.
+    assert store.get_run(parallel["id"])["current_item_id"] is None
+

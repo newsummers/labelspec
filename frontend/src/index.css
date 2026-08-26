@@ -133,8 +133,8 @@ a { color: inherit; }
 .monitor-panel { overflow: hidden; }
 .monitor-total { display: grid; gap: 3px; text-align: right; color: var(--muted); font-size: 11px; }
 .monitor-total strong { color: var(--ink); font-size: 11px; font-weight: 650; }
-.monitor-total-table { min-width: 470px; gap: 5px; }
-.monitor-total-row { display: grid; grid-template-columns: repeat(5, minmax(70px, auto)); gap: 14px; align-items: center; }
+.monitor-total-table { min-width: 560px; gap: 5px; }
+.monitor-total-row { display: grid; grid-template-columns: repeat(6, minmax(70px, auto)); gap: 14px; align-items: center; }
 .monitor-total-row > * { min-width: 0; white-space: nowrap; }
 .monitor-total-head { color: var(--muted); font-size: 10px; }
 .monitor-total-values { color: var(--ink); font-variant-numeric: tabular-nums; }
