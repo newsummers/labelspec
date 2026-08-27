@@ -452,6 +452,7 @@ type QueryMonitor = {
   duration: number | null
   tokens: TokenSummary
   annotator: ModelSummary
+  verifier: ModelSummary
   stages: string[]
   events: TraceEvent[]
   modelCalls: ModelCall[]
@@ -479,8 +480,8 @@ function addCall(summary: ModelSummary, call: ModelCall) {
   if ((call.attempt || 1) > 1) summary.retries += 1
   if (call.status !== 'success') summary.failures += 1
 }
-function aggregateCalls(calls: ModelCall[]): { total: TokenSummary; annotator: ModelSummary } {
-  const total = emptyTokenSummary(); const annotator = emptyModelSummary()
+function aggregateCalls(calls: ModelCall[]): { total: TokenSummary; annotator: ModelSummary; verifier: ModelSummary } {
+  const total = emptyTokenSummary(); const annotator = emptyModelSummary(); const verifier = emptyModelSummary()
   calls.forEach(call => {
     total.input += call.input_tokens || 0
     total.output += call.output_tokens || 0
@@ -489,9 +490,11 @@ function aggregateCalls(calls: ModelCall[]): { total: TokenSummary; annotator: M
     total.reasoning += call.reasoning_tokens || 0
     const pricing = call.model_id ? modelPricing[call.model_id] : undefined
     if (pricing) total.cost += ((call.input_tokens || 0) * pricing.input + (call.output_tokens || 0) * pricing.output) / 1000
-    if (call.model_role === 'annotator') addCall(annotator, call)
+    const role = (call.model_role || '').toLowerCase()
+    if (role === 'verifier' || call.stage === 'VERIFIER') addCall(verifier, call)
+    else if (role === 'annotator' || call.stage !== 'VERIFIER') addCall(annotator, call)
   })
-  return { total, annotator }
+  return { total, annotator, verifier }
 }
 function queryMonitors(items: Array<{ id: string; text: string }>, detail: RunDetail | null): QueryMonitor[] {
   if (!detail) return []
@@ -521,7 +524,7 @@ function queryMonitors(items: Array<{ id: string; text: string }>, detail: RunDe
       id, text: itemText.get(id) || `Item ${id.slice(0, 8)}`, status: completed ? (annotation?.route || 'completed') : running ? 'running' : 'queued',
       stage, route: annotation?.route, label: annotation?.label, decisionStatus: annotation?.decision.status, confidence: annotation?.confidence,
       duration: started ? Math.max(0, ended - started) : null, tokens: summaries.total,
-      annotator: summaries.annotator, stages, events, modelCalls,
+      annotator: summaries.annotator, verifier: summaries.verifier, stages, events, modelCalls,
     }
   }).sort((a, b) => {
     const ai = items.findIndex(item => item.id === a.id); const bi = items.findIndex(item => item.id === b.id)
@@ -559,6 +562,10 @@ function VerifierPanel({ verifier }: { verifier: Annotation['verifier'] }) {
 function TraceReplicaPanel({ annotation }: { annotation: Annotation }) {
   if (!annotation.replicas?.length) return null
   return <div className="trace-replicas"><div className="trace-section-title">Annotator Trace 副本 <span className="muted">{annotation.replicas.length} 条</span></div><div className="trace-replica-grid">{annotation.replicas.map(replica => <details className="trace-replica" key={replica.replica_index} open={replica.replica_index === 1}><summary><strong>Trace {replica.replica_index}</strong><span>{replica.decision.label || '-'}</span><span>{replica.decision.confidence.toFixed(2)}</span></summary><div className="trace-replica-body"><div><b>候选</b><span>{replica.candidates.join('、') || '无'}</span></div><div><b>理由</b><span>{replica.decision.reason}</span></div><div><b>证据</b><span>{replica.decision.evidence}</span></div><div><b>Rules</b><span className="rules">{replica.decision.leaf_rule_used && <span className="rule-chip">{replica.decision.leaf_rule_used}</span>}{replica.decision.decision_rules_referenced.map(rule => <span className="rule-chip" key={rule}>{rule}</span>)}</span></div></div></details>)}</div></div>
+}
+function VerifierCostSummary({ summary }: { summary: ReturnType<typeof aggregateCalls> }) {
+  if (!summary.verifier.calls) return null
+  return <div className="notice model-cost-summary"><strong>Verifier 费用</strong><span>{modelSummaryText(summary.verifier)}</span></div>
 }
 
 function RunsPage({ runs, standards, refresh, notify }: { runs: Run[]; standards: StandardSummary[]; refresh: () => Promise<void>; notify: (text: string, error?: boolean) => void }) {
@@ -642,6 +649,7 @@ function RunsPage({ runs, standards, refresh, notify }: { runs: Run[]; standards
     {runs.filter(item => item.status === 'completed').length >= 2 && <div className="panel" style={{ marginTop: 16 }}><div className="panel-head"><h2>版本对比</h2><GitCompareArrows size={16} /></div><div className="panel-body"><div className="field-row" style={{ gridTemplateColumns: '1fr 1fr auto' }}><select className="select" value={compareIds[0]} onChange={event => setCompareIds([event.target.value, compareIds[1]])}><option value="">基准运行</option>{runs.filter(item => item.status === 'completed').map(item => <option key={item.id} value={item.id}>{item.dataset_name} · v{item.standard_version}</option>)}</select><select className="select" value={compareIds[1]} onChange={event => setCompareIds([compareIds[0], event.target.value])}><option value="">对比运行</option>{runs.filter(item => item.status === 'completed').map(item => <option key={item.id} value={item.id}>{item.dataset_name} · v{item.standard_version}</option>)}</select><button className="btn" onClick={() => void compare()} disabled={!compareIds[0] || !compareIds[1]}>对比</button></div>{comparison && <CompareView value={comparison} />}</div></div>}
     {annotation && <Modal title="标注详情" wide onClose={() => setAnnotation(null)} footer={<><button className="btn" onClick={() => setAnnotation(null)}>关闭</button><button className="btn primary" disabled={!reviewLabel || !reviewStandard} onClick={() => void review()}><Save size={14} />保存审核</button></>}>
       <dl className="detail-grid"><dt>文本</dt><dd>{annotation.text}</dd><dt>建议 Label</dt><dd>{annotation.label || '-'}</dd><dt>多意图标签</dt><dd>{annotation.labels?.length ? annotation.labels.join('、') : '-'}</dd><dt>路由</dt><dd><Badge value={annotation.route} /></dd><dt>判断理由</dt><dd><div className="reason-with-keys">{annotation.route_reasons.length > 0 && <div className="reason-keys">{annotation.route_reasons.map((reason, index) => <span className="rule-chip reason-key" key={`${reason.source}-${reason.code}-${index}`}>{routeReasonKey(reason)}</span>)}</div>}<div>{annotation.decision.reason}</div></div></dd><dt>原文证据</dt><dd>{annotation.evidence}</dd><dt>候选召回</dt><dd><div className="candidate-chain-list">{candidatePaths.length ? candidatePaths.map((candidate, candidateIndex) => { const definition = annotation.disclosure.definitions.find(item => item.leaf_path === candidate); const selected = candidate === annotation.label; return <div className={`candidate-chain ${selected ? 'selected' : ''}`} key={candidate}><div className="candidate-chain-head"><span className="candidate-index">候选 {candidateIndex + 1}</span><strong>{candidate}</strong>{selected && <span className="candidate-selected">当前建议</span>}</div>{definition?.chain.length ? <div className="candidate-chain-rules">{definition.chain.map((rule, index) => <div className="candidate-chain-rule" key={rule.rule_id}><span className="rule-chip">{rule.rule_id}</span><span className="candidate-level">{index === definition.chain.length - 1 ? '叶子定义' : `第 ${index + 1} 层`}</span><span>{rule.definition}</span></div>)}</div> : <div className="muted">未记录该候选的层级 Definition</div>}</div> }) : <span className="muted">没有记录候选召回结果</span>}</div></dd><dt>规则证据</dt><dd>{annotation.decision.evidence_items?.length ? <div className="stack" style={{ gap: 6 }}>{annotation.decision.evidence_items.map((item, index) => <div key={index}>{String(item.rule_id || item.type || 'evidence')}：{String(item.explanation || item.quote || item.rule_text || '')}</div>)}</div> : '暂无结构化规则证据'}</dd><dt>模型汇总</dt><dd>{annotationCallSummary && <div className="stack" style={{ gap: 5 }}><div>Annotator：{modelSummaryText(annotationCallSummary.annotator)}</div><div>总计：{tokenText(annotationCallSummary.total)} · {costText(annotationCallSummary.total.cost)}</div></div>}</dd><dt>Rules Used</dt><dd><div className="rules">{annotation.rules_used.map(rule => <span className="rule-chip" key={rule}>{rule}</span>)}</div></dd></dl>
+      {annotationCallSummary && <VerifierCostSummary summary={annotationCallSummary} />}
       <VerifierPanel verifier={annotation.verifier} />
       <TraceReplicaPanel annotation={annotation} />
       <HierarchicalLabelPicker standard={reviewStandard} value={reviewLabel} onChange={setReviewLabel} />
@@ -729,6 +737,7 @@ function QueryMonitorPanel({ monitors, run, runTokens, runDuration, cumulativeDu
         <div className="query-flow">{(item.stages.length ? item.stages : ['QUERY']).map(stage => <span className={`query-flow-step ${stage === item.stage ? 'current' : ''}`} key={stage}>{stage}</span>)}</div>
         <div className="three-col monitor-summary-grid">
           <div className="monitor-summary"><div className="monitor-summary-title">Annotator</div><strong>{modelSummaryText(item.annotator)}</strong><small>{item.annotator.models.join(', ') || '暂无模型记录'}{item.annotator.retries ? ` · 重试 ${item.annotator.retries}` : ''}</small></div>
+          <div className="monitor-summary"><div className="monitor-summary-title">Verifier</div><strong>{item.verifier.calls ? modelSummaryText(item.verifier) : '未执行'}</strong><small>{item.verifier.calls ? `${item.verifier.models.join(', ') || '暂无模型记录'}${item.verifier.retries ? ` · 重试 ${item.verifier.retries}` : ''}` : '单 Trace 或历史运行'}</small></div>
           <div className="monitor-summary"><div className="monitor-summary-title">Query 总计</div><strong>{ms(item.duration)} · {item.tokens.total.toLocaleString()} tokens · {costText(item.tokens.cost)}</strong><small>{item.label || '未产出标签'}{item.route ? ` · ${item.route}` : ''}{item.events.some(event => event.stage === 'VERIFIER') ? ' · Verifier 已执行' : ''}</small></div>
         </div>
         <details className="monitor-raw"><summary>查看底层阶段和模型调用明细（{item.events.length} 个事件，{item.modelCalls.length} 次请求）</summary>
