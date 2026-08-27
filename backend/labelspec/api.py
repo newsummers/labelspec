@@ -90,6 +90,10 @@ class RulePatchRequest(BaseModel):
     source_run_id: Optional[str] = None
 
 
+class RulePatchEditRequest(BaseModel):
+    payload: Dict[str, Any]
+
+
 class ManualVersionRequest(BaseModel):
     compiled: Dict[str, Any]
     reason: str = Field(min_length=1, max_length=500)
@@ -440,8 +444,8 @@ def dataset_items(dataset_id: str) -> List[Dict[str, Any]]:
 def create_run(payload: RunRequest, background_tasks: BackgroundTasks) -> Dict[str, Any]:
     try:
         standard = store.get_standard(payload.standard_id)
-        if standard["status"] != "active":
-            raise ValueError("只能使用已激活的 Standard 运行标注")
+        if standard["status"] == "draft":
+            raise ValueError("草稿 Standard 不能直接运行，请先激活")
         store.get_dataset(payload.dataset_id)
         run = store.create_run(
             payload.dataset_id, payload.standard_id, concurrency=payload.concurrency,
@@ -633,8 +637,17 @@ def rule_patches(standard_id: Optional[str] = None, status: Optional[str] = None
 
 
 @app.patch("/api/rule-patches/{patch_id}")
-def update_rule_patch(patch_id: str, status: str) -> Dict[str, Any]:
+def update_rule_patch(
+    patch_id: str,
+    status: Optional[str] = None,
+    payload: Optional[RulePatchEditRequest] = None,
+) -> Dict[str, Any]:
     try:
+        result = store.get_rule_patch(patch_id)
+        if payload is not None:
+            result = store.update_rule_patch_payload(patch_id, payload.payload)
+        if status is None:
+            return result
         if status == "applied":
             raise ValueError("Rule Patch 必须通过 apply 接口生效，不能直接标记 applied")
         return store.update_rule_patch_status(patch_id, status)
@@ -646,6 +659,10 @@ def update_rule_patch(patch_id: str, status: str) -> Dict[str, Any]:
 def apply_rule_patch(patch_id: str, background_tasks: BackgroundTasks) -> Dict[str, Any]:
     try:
         result = service.apply_rule_patch(patch_id)
+        # A patch creates an immutable successor. Activating it archives the
+        # previous active version without deleting it, so historical v1 runs
+        # and explicit reruns against v1 remain available.
+        result["standard"] = store.activate_standard(result["standard"]["id"])
         patch = result["patch"]
         source_run_id = patch.get("source_run_id")
         operations = patch.get("payload", {}).get("operations", [])

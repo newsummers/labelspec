@@ -160,6 +160,36 @@ def test_manual_edit_creates_draft_version_and_change_log(store) -> None:
     )
 
 
+def test_rule_patch_creates_successor_without_overwriting_parent(store) -> None:
+    first = store.create_standard("source", standard(), status="active")
+    patch = store.save_rule_patch(
+        first["id"],
+        {
+            "reason": "补充贷款展期定义",
+            "operations": [{
+                "action": "update",
+                "rule_type": "definition",
+                "rule_id": "D002",
+                "after": {
+                    **first["compiled"]["definition_rules"][1],
+                    "definition": "借款、利率、额度、还款、展期等贷款诉求",
+                },
+            }],
+        },
+        [],
+    )
+    store.update_rule_patch_status(patch["id"], "approved")
+    service = LabelSpecService(store, FragmentProvider())
+    result = service.apply_rule_patch(patch["id"])
+
+    second = result["standard"]
+    assert second["version"] == first["version"] + 1
+    assert second["parent_id"] == first["id"]
+    assert second["status"] == "draft"
+    assert store.get_standard(first["id"])["status"] == "active"
+    assert store.get_standard(first["id"])["compiled"]["definition_rules"][1]["definition"] != second["compiled"]["definition_rules"][1]["definition"]
+
+
 def test_manual_edit_keeps_conflicts_until_explicitly_resolved(store) -> None:
     value = standard()
     value.conflicts = [

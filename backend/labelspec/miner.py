@@ -44,6 +44,30 @@ class SpecGapMiner:
             }
             for item in feedback
         ]
+        # Verifier SPEC_GAP findings are actionable evidence even before a
+        # human has reviewed the annotation. Keep them in the same mining
+        # pipeline, while using the immutable annotation id as the case key.
+        for annotation in self.store.list_annotations(run_id):
+            verifier = annotation.get("verifier") or {}
+            if verifier.get("diagnosis") != "SPEC_GAP" or not verifier.get("standard_feedback"):
+                continue
+            failures.append({
+                "item_id": annotation["item_id"],
+                "text": annotation["text"],
+                "route": annotation.get("route", "REVIEW"),
+                "evidence": annotation.get("evidence", ""),
+                "route_reasons": [{
+                    "code": "VERIFIER_SPEC_GAP",
+                    "message": verifier.get("reason") or verifier.get("summary", "Verifier 识别到标准缺口"),
+                }],
+                "rules_used": annotation.get("rules_used", []),
+                "candidates": verifier.get("labels") or annotation.get("candidates", []),
+                "model_label": annotation.get("label"),
+                "human_label": verifier.get("inferred_intent") or annotation.get("label"),
+                "feedback_id": annotation["id"],
+                "standard_feedback": verifier["standard_feedback"],
+                "source": "VERIFIER",
+            })
         if not failures:
             return []
         groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -77,6 +101,8 @@ class SpecGapMiner:
                             "evidence": case["evidence"],
                             "route_reasons": case["route_reasons"],
                             "feedback_id": case["feedback_id"],
+                            "standard_feedback": case.get("standard_feedback"),
+                            "source": case.get("source", "HUMAN"),
                         }
                         for case in cluster[:30]
                     ],

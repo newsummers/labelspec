@@ -1241,6 +1241,19 @@ class Store:
             )
         return self.get_rule_patch(patch_id)
 
+    def update_rule_patch_payload(self, patch_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        with self.connect() as db:
+            row = db.execute("SELECT id, status FROM rule_patches WHERE id = ?", (patch_id,)).fetchone()
+            if not row:
+                raise KeyError(f"Rule Patch {patch_id} 不存在")
+            if row["status"] != "proposed":
+                raise ValueError("只有 proposed 状态的 Rule Patch 可以编辑")
+            db.execute(
+                "UPDATE rule_patches SET payload_json = ?, reviewed_at = NULL WHERE id = ?",
+                (_json(payload), patch_id),
+            )
+        return self.get_rule_patch(patch_id)
+
     def historical_cases(self, exclude_item_id: str, limit: int = 100) -> List[Dict[str, Any]]:
         with self.connect() as db:
             rows = db.execute(
