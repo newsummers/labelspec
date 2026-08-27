@@ -28,22 +28,7 @@ class SpecGapMiner:
         settings = self.store.get_settings()
         run = self.store.get_run(run_id)
         standard = self.store.get_standard(run["standard_id"])["compiled"]
-        feedback = self.store.list_feedback(run_id=run_id)
-        failures = [
-            {
-                "item_id": item["item_id"],
-                "text": item["text"],
-                "route": "REVIEW",
-                "evidence": item["evidence_snapshot"].get("evidence", ""),
-                "route_reasons": [{"code": item["reason_code"], "message": item["note"]}],
-                "rules_used": item["evidence_snapshot"].get("decision", {}).get("decision_rules_referenced", []),
-                "candidates": [item["human_label"]],
-                "model_label": item["model_label"],
-                "human_label": item["human_label"],
-                "feedback_id": item["id"],
-            }
-            for item in feedback
-        ]
+        failures: List[Dict[str, Any]] = []
         # Verifier SPEC_GAP findings are actionable evidence even before a
         # human has reviewed the annotation. Keep them in the same mining
         # pipeline, while using the immutable annotation id as the case key.
@@ -80,12 +65,17 @@ class SpecGapMiner:
             groups[signature].append(item)
 
         created: List[Dict[str, Any]] = []
+        existing_signatures = {
+            item["signature"] for item in self.store.list_suggestions(run_id)
+        }
         for signature, cases in groups.items():
             if len(cases) < settings.spec_gap_min_cluster_size:
                 continue
             clusters = await self._semantic_clusters(cases, settings.embedding_model)
             for index, cluster in enumerate(clusters):
                 if len(cluster) < settings.spec_gap_min_cluster_size:
+                    continue
+                if f"{signature}#{index}" in existing_signatures:
                     continue
                 candidates = sorted({label for case in cluster for label in case["candidates"]})
                 rule_ids = sorted({rule_id for case in cluster for rule_id in case["rules_used"]})

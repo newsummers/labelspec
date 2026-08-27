@@ -769,8 +769,22 @@ function GapsPage({ runs, refresh, notify }: { runs: Run[]; refresh: () => Promi
   const [patchEditing, setPatchEditing] = useState<Suggestion | null>(null)
   const [patchJson, setPatchJson] = useState('')
   const [patchReason, setPatchReason] = useState('')
-  useEffect(() => { void api.suggestions(runId || undefined).then(setSuggestions).catch(error => notify(error.message, true)) }, [runId, notify])
-  async function mine() { if (!runId) return; setBusy(true); try { const result = await api.mine(runId); setSuggestions(result.suggestions); notify(result.suggestions.length ? `生成 ${result.suggestions.length} 条建议` : '没有达到聚类阈值的失败模式') } catch (error) { notify(error instanceof Error ? error.message : '挖掘失败', true) } finally { setBusy(false) } }
+  useEffect(() => {
+    if (!runId) { setSuggestions([]); return }
+    let cancelled = false
+    async function loadSuggestions() {
+      try {
+        const existing = await api.suggestions(runId)
+        if (existing.length || cancelled) { if (!cancelled) setSuggestions(existing); return }
+        // Backfill completed runs created before automatic mining was added.
+        // New runs already mine at completion, so this is normally a no-op.
+        const mined = await api.mine(runId)
+        if (!cancelled) setSuggestions(mined.suggestions)
+      } catch (error) { if (!cancelled) notify(error instanceof Error ? error.message : '加载规则建议失败', true) }
+    }
+    void loadSuggestions()
+    return () => { cancelled = true }
+  }, [runId, notify])
   async function reviseAndRerun() {
     if (!editing) return
     const run = runs.find(value => value.id === editing.run_id); if (!run) return
@@ -817,7 +831,7 @@ function GapsPage({ runs, refresh, notify }: { runs: Run[]; refresh: () => Promi
     } catch (error) { notify(error instanceof Error ? error.message : '保存 Patch 失败', true) } finally { setBusy(false) }
   }
   return <>
-    <PageHead title="规则进化" meta={`${suggestions.length} 条待审批建议`}><select className="select" style={{ width: 260 }} value={runId} onChange={event => setRunId(event.target.value)}><option value="">选择已完成运行</option>{completed.map(run => <option key={run.id} value={run.id}>{run.dataset_name} · Standard v{run.standard_version}</option>)}</select><button className="btn primary" disabled={!runId || busy} onClick={() => void mine()}>{busy ? <Spinner /> : <Sparkles size={15} />}基于人工反馈生成 Patch</button></PageHead>
+    <PageHead title="规则进化" meta={`${suggestions.length} 条待审批建议`}><select className="select" style={{ width: 260 }} value={runId} onChange={event => setRunId(event.target.value)}><option value="">选择已完成运行</option>{completed.map(run => <option key={run.id} value={run.id}>{run.dataset_name} · Standard v{run.standard_version}</option>)}</select></PageHead>
     <div className="panel">{suggestions.length ? suggestions.map(item => <div className="suggestion" key={item.id}><div className="actions" style={{ justifyContent: 'space-between' }}><div><h3>{item.payload.title}</h3><div className="list-meta"><Badge value={item.patch?.status || item.status} />{item.payload.labels.map(label => <span key={label}>{label}</span>)}{item.payload.target_rule_id && <span className="rule-chip">{item.payload.target_rule_id}</span>}</div></div>{item.patch?.status === 'proposed' && <><button className="btn" disabled={busy} onClick={() => editPatch(item)}><Pencil size={14} />编辑 Patch</button><button className="btn primary" disabled={busy} onClick={() => void approveAndApply(item)}>批准 Patch 并生成 v2 <ArrowRight size={14} /></button></>}</div><p><b>问题：</b>{item.payload.problem}</p><p><b>建议：</b>{item.payload.proposed_change}</p><p className="muted">Patch 操作：{item.payload.operations?.length || 0} 个，必须人工批准后才会生成新 Standard。</p><ul className="case-list">{item.payload.typical_cases.map(value => <li key={value}>{value}</li>)}</ul></div>) : <Empty icon={Lightbulb} title="暂无 Rule Patch" />}</div>
     {patchEditing && <Modal title="编辑 Rule Patch" onClose={() => !busy && setPatchEditing(null)} footer={<><button className="btn" disabled={busy} onClick={() => setPatchEditing(null)}>取消</button><button className="btn primary" disabled={busy || !patchReason.trim()} onClick={() => void savePatch()}>{busy ? <Spinner /> : <Save size={14} />}保存 Patch</button></>}><div className="notice">保存后仍需人工批准，批准后会从当前 Standard 生成新的版本，不会覆盖原版本。</div><div className="field"><label>Operations JSON</label><textarea className="textarea json" value={patchJson} onChange={event => setPatchJson(event.target.value)} /></div><div className="field"><label>Patch 原因</label><textarea className="textarea" value={patchReason} onChange={event => setPatchReason(event.target.value)} /></div></Modal>}
     {editing && <Modal title={`修改 ${editing.payload.target_rule_id}`} onClose={() => !busy && setEditing(null)} footer={<><button className="btn" disabled={busy} onClick={() => setEditing(null)}>取消</button><button className="btn primary" disabled={busy || !reason.trim()} onClick={() => void reviseAndRerun()}>{busy ? <Spinner /> : <Play size={14} />}生成 v2 并重跑</button></>}><div className="notice">{editing.payload.proposed_change}</div><div className="field"><label>Rule JSON</label><textarea className="textarea json" value={ruleJson} onChange={event => setRuleJson(event.target.value)} /></div><div className="field"><label>修改原因</label><textarea className="textarea" value={reason} onChange={event => setReason(event.target.value)} /></div></Modal>}

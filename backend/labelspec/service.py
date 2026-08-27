@@ -310,6 +310,34 @@ class LabelSpecService:
                 current_item_id=None, current_stage="COMPLETED",
                 completed_at=utc_now(),
             )
+            # Verifier findings are mined automatically after the immutable
+            # annotation results are committed. Mining failure must never
+            # turn a successful annotation run into a failed run.
+            try:
+                from .miner import SpecGapMiner
+                await self._emit_event(
+                    run_id, None, "RULE_MINER", "STAGE_STARTED", "running",
+                    "根据 Verifier 结果自动分析规则缺口",
+                    model_role="miner", model_id=settings.miner_model,
+                )
+                with self._provider_context(
+                    run_id=run_id, stage="RULE_MINER", model_role="miner"
+                ):
+                    suggestions = await SpecGapMiner(self.provider, self.store).mine(run_id)
+                await self._emit_event(
+                    run_id, None, "RULE_MINER", "STAGE_COMPLETED", "success",
+                    f"自动生成 {len(suggestions)} 条 Rule Patch 建议",
+                    model_role="miner", model_id=settings.miner_model,
+                    metadata={"suggestions": len(suggestions)},
+                )
+            except Exception:
+                logger.exception("Automatic Rule Patch mining failed for run %s", run_id)
+                await self._emit_event(
+                    run_id, None, "RULE_MINER", "STAGE_FAILED", "error",
+                    "自动 Rule Patch 挖掘失败",
+                    model_role="miner", model_id=settings.miner_model,
+                )
+            self.store.update_run(run_id, current_stage="COMPLETED")
         except Exception as exc:
             logger.exception("Annotation run %s failed", run_id)
             await self._emit_event(
@@ -1028,14 +1056,14 @@ class LabelSpecService:
         result = self.create_manual_version(
             patch["standard_id"],
             compiled,
-            patch["payload"].get("reason", "基于人工反馈应用 Rule Patch"),
+            patch["payload"].get("reason", "基于 Verifier 反馈应用 Rule Patch"),
         )
         saved = result["standard"]
         for rule_id, before, after, _ in changes:
             self.store.record_rule_change(
                 patch["standard_id"], saved["id"], rule_id,
                 before or {}, after or {},
-                patch["payload"].get("reason", "基于人工反馈应用 Rule Patch"),
+                patch["payload"].get("reason", "基于 Verifier 反馈应用 Rule Patch"),
                 patch["related_feedback_ids"],
             )
         self.store.update_rule_patch_status(patch_id, "applied", saved["id"])
