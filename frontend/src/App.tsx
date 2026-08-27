@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import {
   AlertTriangle, ArrowRight, BarChart3, Check, ChevronRight, CircleGauge, Database,
   FileCode2, FileDown, FlaskConical, GitBranch, GitCompareArrows, Layers3, Lightbulb, LoaderCircle,
-  Pencil, Trash2,
+  Pencil, Trash2, Pause,
   Play, Plus, RefreshCw, Save, ScanSearch, Settings, ShieldCheck, Sparkles,
   Upload, X,
 } from 'lucide-react'
@@ -579,6 +579,7 @@ function RunsPage({ runs, standards, refresh, notify }: { runs: Run[]; standards
   const [compareIds, setCompareIds] = useState<[string, string]>(['', ''])
   const [comparison, setComparison] = useState<{ left: { run: Run; metrics: Metrics }; right: { run: Run; metrics: Metrics } } | null>(null)
   const [retrying, setRetrying] = useState(false)
+  const [pausing, setPausing] = useState(false)
   const detailRef = useRef<RunDetail | null>(null)
   useEffect(() => { detailRef.current = detail }, [detail])
   useEffect(() => { if (!selectedId && runs[0]) setSelectedId(runs[0].id) }, [runs, selectedId])
@@ -628,6 +629,8 @@ function RunsPage({ runs, standards, refresh, notify }: { runs: Run[]; standards
   async function review() { if (!annotation || !reviewLabel) return; try { await api.review(annotation.id, reviewLabel, reviewNote); notify('人工审核已保存'); setAnnotation(null); await loadDetail() } catch (error) { notify(error instanceof Error ? error.message : '保存失败', true) } }
   async function compare() { if (!compareIds[0] || !compareIds[1]) return; try { setComparison(await api.compare(compareIds[0], compareIds[1])) } catch (error) { notify(error instanceof Error ? error.message : '对比失败', true) } }
   async function retry() { if (!detail || detail.run.status !== 'failed') return; setRetrying(true); try { await api.retryRun(detail.run.id); notify(`已从 ${detail.run.processed}/${detail.run.total} 继续运行`); await refresh(); await loadDetail() } catch (error) { notify(error instanceof Error ? error.message : '继续运行失败', true) } finally { setRetrying(false) } }
+  async function resume() { if (!detail || !(detail.run.current_stage === 'PAUSED' && detail.run.status === 'queued')) return; setRetrying(true); try { await api.retryRun(detail.run.id); notify(`已从 ${detail.run.processed}/${detail.run.total} 继续运行`); await refresh(); await loadDetail() } catch (error) { notify(error instanceof Error ? error.message : '继续运行失败', true) } finally { setRetrying(false) } }
+  async function pause() { if (!detail || detail.run.status !== 'running') return; setPausing(true); try { await api.pauseRun(detail.run.id); notify('已请求暂停，当前 query 收尾后停止新任务'); await loadDetail() } catch (error) { notify(error instanceof Error ? error.message : '暂停失败', true) } finally { setPausing(false) } }
   const filtered = detail?.annotations.filter(item => filter === 'ALL' || item.route === filter) || []
   const monitors = useMemo(() => queryMonitors(items, detail), [items, detail])
   const runTokens = monitors.reduce<TokenSummary>((sum, item) => ({ input: sum.input + item.tokens.input, output: sum.output + item.tokens.output, total: sum.total + item.tokens.total, cached: sum.cached + item.tokens.cached, reasoning: sum.reasoning + item.tokens.reasoning, cost: sum.cost + item.tokens.cost }), emptyTokenSummary())
@@ -639,7 +642,7 @@ function RunsPage({ runs, standards, refresh, notify }: { runs: Run[]; standards
   const candidatePaths = annotation?.disclosure.candidates || annotation?.disclosure.definitions.map(item => item.leaf_path) || []
   const reviewStandard = detail ? standards.find(item => item.id === detail.run.standard_id) : undefined
   return <>
-    <PageHead title="标注运行" meta={`${runs.length} 次运行`}><select className="select run-selector" aria-label="选择标注运行" title="选择标注运行" value={selectedId} onChange={event => setSelectedId(event.target.value)} disabled={!runs.length}><option value="">选择运行</option>{runs.map(run => <option key={run.id} value={run.id}>{run.dataset_name} · v{run.standard_version} · {run.status}</option>)}</select>{detail?.run.status === 'completed' && <><a className="btn" href={`/api/runs/${detail.run.id}/export?format=csv`}><Upload size={15} style={{ transform: 'rotate(180deg)' }} />导出结果</a><a className="btn" href={`/api/runs/${detail.run.id}/export?format=jsonl&gold_only=true`}><ShieldCheck size={15} />导出 Gold</a></>}{detail?.run.status === 'failed' && <button className="btn primary" disabled={retrying} onClick={() => void retry()}>{retrying ? <Spinner /> : <Play size={15} />}继续运行</button>}<button className="btn" onClick={() => void refresh()}><RefreshCw size={15} />刷新</button></PageHead>
+    <PageHead title="标注运行" meta={`${runs.length} 次运行`}><select className="select run-selector" aria-label="选择标注运行" title="选择标注运行" value={selectedId} onChange={event => setSelectedId(event.target.value)} disabled={!runs.length}><option value="">选择运行</option>{runs.map(run => <option key={run.id} value={run.id}>{run.dataset_name} · v{run.standard_version} · {run.status}</option>)}</select>{detail?.run.status === 'completed' && <><a className="btn" href={`/api/runs/${detail.run.id}/export?format=csv`}><Upload size={15} style={{ transform: 'rotate(180deg)' }} />导出结果</a><a className="btn" href={`/api/runs/${detail.run.id}/export?format=jsonl&gold_only=true`}><ShieldCheck size={15} />导出 Gold</a></>}{detail?.run.status === 'running' && <button className="btn" disabled={pausing} onClick={() => void pause()}>{pausing ? <Spinner /> : <Pause size={15} />}暂停标注</button>}{detail?.run.status === 'failed' && <button className="btn primary" disabled={retrying} onClick={() => void retry()}>{retrying ? <Spinner /> : <Play size={15} />}继续运行</button>}{detail?.run.status === 'queued' && detail?.run.current_stage === 'PAUSED' && <button className="btn primary" disabled={retrying} onClick={() => void resume()}>{retrying ? <Spinner /> : <Play size={15} />}继续运行</button>}<button className="btn" onClick={() => void refresh()}><RefreshCw size={15} />刷新</button></PageHead>
     <div className="run-detail-layout">{detail ? <>
         <div className="four-col"><div className="metric"><div className="metric-label">自动通过率</div><div className="metric-value">{pct(detail.metrics.auto_accept_rate)}</div></div><div className="metric"><div className="metric-label">准确率</div><div className="metric-value">{pct(detail.metrics.accuracy)}</div><div className="metric-foot">n={detail.metrics.accuracy_sample_size}</div></div><div className="metric"><div className="metric-label">审核率</div><div className="metric-value">{pct(detail.metrics.review_rate)}</div></div><div className="metric"><div className="metric-label">人工反馈</div><div className="metric-value">{detail.metrics.routes.REVIEW || 0}</div></div></div>
         <QueryMonitorPanel monitors={monitors} run={detail.run} runTokens={runTokens} runDuration={runDuration} cumulativeDuration={cumulativeDuration} />

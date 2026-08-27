@@ -176,6 +176,7 @@ class Store:
                     processed INTEGER NOT NULL DEFAULT 0,
                     concurrency INTEGER NOT NULL DEFAULT 1,
                     trace_replicas INTEGER NOT NULL DEFAULT 1,
+                    pause_requested INTEGER NOT NULL DEFAULT 0,
                     scope_item_ids_json TEXT,
                     error TEXT,
                     current_item_id TEXT,
@@ -334,6 +335,10 @@ class Store:
             if "trace_replicas" not in run_columns:
                 db.execute(
                     "ALTER TABLE annotation_runs ADD COLUMN trace_replicas INTEGER NOT NULL DEFAULT 1"
+                )
+            if "pause_requested" not in run_columns:
+                db.execute(
+                    "ALTER TABLE annotation_runs ADD COLUMN pause_requested INTEGER NOT NULL DEFAULT 0"
                 )
             annotation_columns = {row["name"] for row in db.execute("PRAGMA table_info(annotations)")}
             if "replicas_json" not in annotation_columns:
@@ -868,6 +873,7 @@ class Store:
             "status", "processed", "error", "completed_at",
             "current_item_id", "current_stage", "concurrency",
             "trace_replicas",
+            "pause_requested",
         }
         data = {key: value for key, value in fields.items() if key in allowed}
         if not data:
@@ -876,6 +882,8 @@ class Store:
             data["concurrency"] = normalize_concurrency(data["concurrency"])
         if "trace_replicas" in data:
             data["trace_replicas"] = normalize_trace_replicas(data["trace_replicas"])
+        if "pause_requested" in data:
+            data["pause_requested"] = 1 if data["pause_requested"] else 0
         assignments = ", ".join(f"{key} = ?" for key in data)
         with self.connect() as db:
             db.execute(f"UPDATE annotation_runs SET {assignments} WHERE id = ?", [*data.values(), run_id])

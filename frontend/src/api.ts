@@ -55,6 +55,7 @@ export const api = {
   runs: () => request<Run[]>('/api/runs'),
   createRun: (dataset_id: string, standard_id: string, concurrency = 1, trace_replicas = 3) => request<Run>('/api/runs', { method: 'POST', body: JSON.stringify({ dataset_id, standard_id, concurrency, trace_replicas }) }),
   retryRun: (id: string) => request<Run>(`/api/runs/${id}/retry`, { method: 'POST' }),
+  pauseRun: (id: string) => request<Run>(`/api/runs/${id}/pause`, { method: 'POST' }),
   run: (id: string) => request<RunDetail>(`/api/runs/${id}`),
   review: (id: string, human_label: string, note: string) => request(`/api/annotations/${id}/review`, { method: 'POST', body: JSON.stringify({ human_label, note }) }),
   mine: (id: string) => request<{ suggestions: Suggestion[] }>(`/api/runs/${id}/mine`, { method: 'POST' }),

@@ -27,12 +27,15 @@ def test_run_persists_and_clamps_its_concurrency(store) -> None:
 
     default_run = store.create_run(dataset["id"], saved["id"])
     assert store.get_run(default_run["id"])["concurrency"] == 1
+    assert store.get_run(default_run["id"])["pause_requested"] == 0
 
     run = store.create_run(dataset["id"], saved["id"], concurrency=MAX_RUN_CONCURRENCY + 10)
     assert store.get_run(run["id"])["concurrency"] == MAX_RUN_CONCURRENCY
 
     store.update_run(run["id"], concurrency=0)
     assert store.get_run(run["id"])["concurrency"] == 1
+    store.update_run(run["id"], pause_requested=1)
+    assert store.get_run(run["id"])["pause_requested"] == 1
 
 
 def test_dataset_assigns_unique_internal_ids(store) -> None:

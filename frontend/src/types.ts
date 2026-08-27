@@ -81,6 +81,7 @@ export interface Run {
   processed: number
   concurrency?: number
   trace_replicas?: number
+  pause_requested?: number
   current_item_id?: string
   current_stage?: string
   error?: string

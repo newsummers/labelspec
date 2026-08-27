@@ -471,8 +471,9 @@ def retry_run(
 ) -> Dict[str, Any]:
     try:
         run = store.get_run(run_id)
-        if run["status"] != "failed":
-            raise ValueError("只能继续失败的运行")
+        paused = run.get("status") == "queued" and run.get("current_stage") == "PAUSED"
+        if run["status"] != "failed" and not paused:
+            raise ValueError("只能继续失败或已暂停的运行")
         # Continuing keeps the original parallelism unless the caller overrides it.
         updates: Dict[str, Any] = {"status": "queued", "error": None, "completed_at": None}
         if concurrency is not None:
@@ -483,8 +484,21 @@ def retry_run(
             if not 1 <= trace_replicas <= MAX_TRACE_REPLICAS:
                 raise ValueError(f"Trace 副本数必须在 1 到 {MAX_TRACE_REPLICAS} 之间")
             updates["trace_replicas"] = trace_replicas
+        updates["pause_requested"] = 0
         store.update_run(run_id, **updates)
         background_tasks.add_task(service.process_run, run_id)
+        return store.get_run(run_id)
+    except Exception as exc:
+        raise _handle_error(exc) from exc
+
+
+@app.post("/api/runs/{run_id}/pause")
+def pause_run(run_id: str) -> Dict[str, Any]:
+    try:
+        run = store.get_run(run_id)
+        if run["status"] != "running":
+            raise ValueError("只能暂停正在运行的任务")
+        store.update_run(run_id, pause_requested=1)
         return store.get_run(run_id)
     except Exception as exc:
         raise _handle_error(exc) from exc

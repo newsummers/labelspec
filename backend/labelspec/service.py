@@ -257,6 +257,9 @@ class LabelSpecService:
 
     async def process_run(self, run_id: str) -> None:
         run = self.store.get_run(run_id)
+        if run.get("pause_requested"):
+            self.store.update_run(run_id, current_stage="PAUSED")
+            return
         standard = parse_compiled_standard(
             self.store.get_standard(run["standard_id"])["compiled"]
         )
@@ -301,6 +304,16 @@ class LabelSpecService:
                 total=len(items), already_completed=completed_count,
                 workers=workers, trace_replicas=trace_replicas,
             )
+            if self.store.get_run(run_id).get("pause_requested"):
+                await self._emit_event(
+                    run_id, None, "RUN", "STAGE_PAUSED", "success",
+                    "已暂停，当前 query 收尾后停止领取新任务",
+                )
+                self.store.update_run(
+                    run_id, status="queued", current_item_id=None,
+                    current_stage="PAUSED", completed_at=None,
+                )
+                return
             await self._emit_event(
                 run_id, None, "RUN", "STAGE_COMPLETED", "success", "标注运行完成",
                 metadata={"processed": len(items), "total": len(items)},
@@ -377,9 +390,14 @@ class LabelSpecService:
 
         async def worker() -> None:
             while not failure:
+                if self.store.get_run(run_id).get("pause_requested"):
+                    return
                 try:
                     item = queue.get_nowait()
                 except asyncio.QueueEmpty:
+                    return
+                if self.store.get_run(run_id).get("pause_requested"):
+                    queue.task_done()
                     return
                 try:
                     if trace_replicas <= 1:
