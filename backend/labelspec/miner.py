@@ -69,12 +69,19 @@ class SpecGapMiner:
             item["signature"] for item in self.store.list_suggestions(run_id)
         }
         for signature, cases in groups.items():
-            if len(cases) < settings.spec_gap_min_cluster_size:
-                continue
             clusters = await self._semantic_clusters(cases, settings.embedding_model)
-            for index, cluster in enumerate(clusters):
-                if len(cluster) < settings.spec_gap_min_cluster_size:
-                    continue
+            eligible_clusters = [
+                cluster for cluster in clusters
+                if len(cluster) >= settings.spec_gap_min_cluster_size
+            ]
+            # Verifier is treated as the expert result and every SPEC_GAP is
+            # already reviewable evidence. When a run has too few repeated
+            # cases to form a stable cluster, keep each case as an isolated
+            # proposed patch instead of hiding the feedback entirely. These
+            # patches remain proposed and require human approval.
+            if not eligible_clusters and any(case.get("source") == "VERIFIER" for case in cases):
+                eligible_clusters = [[case] for case in cases]
+            for index, cluster in enumerate(eligible_clusters):
                 if f"{signature}#{index}" in existing_signatures:
                     continue
                 candidates = sorted({label for case in cluster for label in case["candidates"]})
@@ -97,13 +104,18 @@ class SpecGapMiner:
                         for case in cluster[:30]
                     ],
                 }
-                suggestion = await self.provider.structured(
-                    model=settings.miner_model,
-                    system=MINER_SYSTEM,
-                    user=json.dumps(payload, ensure_ascii=False),
-                    response_model=MinerSuggestion,
-                    temperature=0.15,
-                )
+                try:
+                    suggestion = await self.provider.structured(
+                        model=settings.miner_model,
+                        system=MINER_SYSTEM,
+                        user=json.dumps(payload, ensure_ascii=False),
+                        response_model=MinerSuggestion,
+                        temperature=0.15,
+                    )
+                except Exception:
+                    # One malformed/rate-limited Miner response must not hide
+                    # all other independent Verifier gaps in the same run.
+                    continue
                 patch = self.store.save_rule_patch(
                     run["standard_id"],
                     suggestion.model_dump(mode="json"),
