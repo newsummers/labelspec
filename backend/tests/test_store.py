@@ -50,6 +50,18 @@ def test_dataset_assigns_unique_internal_ids(store) -> None:
     assert by_text["第二条"]["source_id"] == "source-1"
 
 
+def test_delete_impact_run_keeps_parent_run_and_standard_history(store) -> None:
+    saved = store.create_standard("source", standard(), status="active")
+    dataset = store.create_dataset("data", "data.csv", [{"text": "一条数据"}])
+    parent = store.create_run(dataset["id"], saved["id"])
+    child = store.create_run(dataset["id"], saved["id"], parent_run_id=parent["id"], scope_item_ids=[])
+    deleted = store.delete_run(child["id"])
+    assert deleted["id"] == child["id"]
+    assert store.get_run(parent["id"])["id"] == parent["id"]
+    with pytest.raises(KeyError):
+        store.get_run(child["id"])
+
+
 def test_dataset_can_be_deleted_before_annotation(store) -> None:
     dataset = store.create_dataset("test", "test.csv", [{"text": "一条数据"}])
     result = store.delete_dataset(dataset["id"])

@@ -888,6 +888,34 @@ class Store:
         with self.connect() as db:
             db.execute(f"UPDATE annotation_runs SET {assignments} WHERE id = ?", [*data.values(), run_id])
 
+    def delete_run(self, run_id: str) -> Dict[str, Any]:
+        """Delete one annotation run and its derived runtime artifacts."""
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT id, parent_run_id, status, processed, total FROM annotation_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError(f"Run {run_id} 不存在")
+            child = db.execute(
+                "SELECT id FROM annotation_runs WHERE parent_run_id = ? LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            if child:
+                raise ValueError("该运行存在派生重跑，不能删除")
+            if row["status"] == "running":
+                raise ValueError("运行中的任务不能删除，请先暂停或等待结束")
+            # These tables do not all declare ON DELETE CASCADE because their
+            # run_id is intentionally nullable/legacy-compatible.
+            db.execute("DELETE FROM annotation_feedback WHERE annotation_id IN (SELECT id FROM annotations WHERE run_id = ?)", (run_id,))
+            db.execute("DELETE FROM annotations WHERE run_id = ?", (run_id,))
+            db.execute("DELETE FROM annotation_events WHERE run_id = ?", (run_id,))
+            db.execute("DELETE FROM model_calls WHERE run_id = ?", (run_id,))
+            db.execute("DELETE FROM suggestions WHERE run_id = ?", (run_id,))
+            db.execute("DELETE FROM rule_patches WHERE source_run_id = ?", (run_id,))
+            db.execute("DELETE FROM annotation_runs WHERE id = ?", (run_id,))
+        return dict(row)
+
     def save_annotation_event(
         self,
         run_id: str,

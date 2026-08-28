@@ -462,6 +462,14 @@ def runs() -> List[Dict[str, Any]]:
     return store.list_runs()
 
 
+@app.delete("/api/runs/{run_id}")
+def delete_run(run_id: str) -> Dict[str, Any]:
+    try:
+        return store.delete_run(run_id)
+    except Exception as exc:
+        raise _handle_error(exc) from exc
+
+
 @app.post("/api/runs/{run_id}/retry")
 def retry_run(
     run_id: str,
