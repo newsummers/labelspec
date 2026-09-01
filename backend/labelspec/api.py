@@ -94,6 +94,10 @@ class RulePatchEditRequest(BaseModel):
     payload: Dict[str, Any]
 
 
+class BatchRulePatchRequest(BaseModel):
+    patch_ids: List[str] = Field(min_length=1)
+
+
 class ManualVersionRequest(BaseModel):
     compiled: Dict[str, Any]
     reason: str = Field(min_length=1, max_length=500)
@@ -677,34 +681,21 @@ def update_rule_patch(
         raise _handle_error(exc) from exc
 
 
+@app.post("/api/rule-patches/batch-apply")
+def batch_apply_rule_patches(payload: BatchRulePatchRequest) -> Dict[str, Any]:
+    try:
+        result = service.apply_rule_patches(payload.patch_ids)
+        result["standard"] = store.activate_standard(result["standard"]["id"])
+        return result
+    except Exception as exc:
+        raise _handle_error(exc) from exc
+
+
 @app.post("/api/rule-patches/{patch_id}/apply")
-def apply_rule_patch(patch_id: str, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+def apply_rule_patch(patch_id: str) -> Dict[str, Any]:
     try:
         result = service.apply_rule_patch(patch_id)
-        # A patch creates an immutable successor. Activating it archives the
-        # previous active version without deleting it, so historical v1 runs
-        # and explicit reruns against v1 remain available.
         result["standard"] = store.activate_standard(result["standard"]["id"])
-        patch = result["patch"]
-        source_run_id = patch.get("source_run_id")
-        operations = patch.get("payload", {}).get("operations", [])
-        rule_id = next(
-            (
-                operation.get("rule_id") or operation.get("after", {}).get("rule_id")
-                for operation in operations
-                if operation.get("rule_id") or operation.get("after", {}).get("rule_id")
-            ),
-            "PATCH",
-        )
-        if source_run_id:
-            impact = service.create_impact_run(
-                source_run_id,
-                result["standard"]["id"],
-                rule_id,
-                result.get("affected_labels", []),
-            )
-            background_tasks.add_task(service.process_run, impact["id"])
-            result["impact_run"] = impact
         return result
     except Exception as exc:
         raise _handle_error(exc) from exc

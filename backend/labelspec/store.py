@@ -4,6 +4,8 @@ import hashlib
 import json
 import sqlite3
 import uuid
+import copy
+import re
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1237,11 +1239,91 @@ class Store:
             row = db.execute("SELECT * FROM rule_patches WHERE id = ?", (patch_id,)).fetchone()
         if not row:
             raise KeyError(f"Rule Patch {patch_id} 不存在")
+        payload = _loads(row["payload_json"], {})
+        payload = self._enrich_rule_patch_payload(row["standard_id"], payload)
         return {
             **dict(row),
-            "payload": _loads(row["payload_json"], {}),
+            "payload": payload,
             "related_feedback_ids": _loads(row["related_feedback_ids_json"], []),
         }
+
+    def _enrich_rule_patch_payload(self, standard_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Backfill immutable before/after snapshots for old and new patches."""
+        try:
+            compiled = self.get_standard(standard_id)["compiled"]
+        except KeyError:
+            return payload
+        collections = {
+            "definition": compiled.get("definition_rules", []),
+            "boundary": compiled.get("decision_rules", {}).get("boundary_rules", []),
+            "priority": compiled.get("decision_rules", {}).get("priority_rules", []),
+        }
+        prefixes = {"definition": "D", "boundary": "B", "priority": "P"}
+        next_numbers = {
+            rule_type: max(
+                [int(match.group(1)) for item in collection
+                 if (match := re.fullmatch(r"[A-Z](\d+)", str(item.get("rule_id", ""))))],
+                default=0,
+            ) + 1
+            for rule_type, collection in collections.items()
+        }
+        enriched = copy.deepcopy(payload)
+        operations = []
+        for original in payload.get("operations", []):
+            operation = copy.deepcopy(original)
+            rule_type = operation.get("rule_type")
+            collection = collections.get(rule_type, [])
+            rule_id = operation.get("rule_id") or (operation.get("after") or {}).get("rule_id")
+            current = next((item for item in collection if item.get("rule_id") == rule_id), None)
+            action = operation.get("action")
+            if action == "add" and rule_type in prefixes:
+                # New rules are always appended after the current highest number.
+                generated_id = f"{prefixes[rule_type]}{next_numbers[rule_type]:03d}"
+                next_numbers[rule_type] += 1
+                operation["rule_id"] = generated_id
+                if isinstance(operation.get("after"), dict):
+                    operation["after"]["rule_id"] = generated_id
+            if "before" not in operation:
+                operation["before"] = copy.deepcopy(current) if action in {"update", "delete"} else None
+            if "after" not in operation:
+                operation["after"] = None if action == "delete" else copy.deepcopy(operation.get("rule"))
+                if action == "add" and isinstance(operation["after"], dict):
+                    operation["after"]["rule_id"] = operation["rule_id"]
+            elif action == "update" and isinstance(current, dict) and isinstance(operation["after"], dict):
+                # Miner responses from older runs sometimes omitted unchanged fields.
+                # Keep the displayed and applied successor a complete rule snapshot.
+                operation["after"] = {**copy.deepcopy(current), **operation["after"]}
+            if isinstance(operation.get("before"), dict):
+                operation["before"] = self._canonical_rule(rule_type, operation["before"])
+            if isinstance(operation.get("after"), dict):
+                operation["after"] = self._canonical_rule(rule_type, operation["after"])
+            # Keep patch operation JSON stable as well: action/type/id, then
+            # the two complete snapshots, followed by any existing metadata.
+            ordered = {}
+            for key in ("action", "rule_type", "rule_id", "before", "after"):
+                if key in operation:
+                    ordered[key] = operation[key]
+            ordered.update({key: value for key, value in operation.items() if key not in ordered})
+            operations.append(ordered)
+        enriched["operations"] = operations
+        return enriched
+
+    @staticmethod
+    def _canonical_rule(rule_type: Optional[str], value: Dict[str, Any]) -> Dict[str, Any]:
+        """Match the field order emitted by the existing domain models."""
+        fields = {
+            "definition": ("rule_id", "label_id", "definition", "include", "exclude", "source_refs"),
+            "boundary": ("rule_id", "label_ids", "scope_label_id", "condition", "decision", "source_refs"),
+            "priority": ("rule_id", "principle", "scope_label_id", "source_refs"),
+        }.get(rule_type or "", ())
+        defaults = {
+            "definition": {"label_id": None, "include": [], "exclude": [], "source_refs": []},
+            "boundary": {"scope_label_id": None, "source_refs": []},
+            "priority": {"scope_label_id": None, "source_refs": []},
+        }.get(rule_type or "", {})
+        ordered = {key: value[key] if key in value else copy.deepcopy(defaults[key]) for key in fields if key in value or key in defaults}
+        ordered.update({key: item for key, item in value.items() if key not in ordered})
+        return ordered
 
     def list_rule_patches(
         self, standard_id: Optional[str] = None, status: Optional[str] = None
@@ -1362,7 +1444,41 @@ class Store:
         sql += " ORDER BY created_at DESC"
         with self.connect() as db:
             rows = db.execute(sql, params).fetchall()
-        return [self.get_suggestion(row["id"]) for row in rows]
+        results = [self.get_suggestion(row["id"]) for row in rows]
+        # Give every reviewable Add operation a unique preview ID in the same
+        # order the UI submits the approved batch. The service assigns again
+        # at apply time, so model-provided duplicate IDs can never collide.
+        next_ids: Dict[tuple[str, str], int] = {}
+        prefixes = {"definition": "D", "boundary": "B", "priority": "P"}
+        for suggestion in results:
+            patch = suggestion.get("patch")
+            if not patch or patch.get("status") not in {"proposed", "approved"}:
+                continue
+            standard_id = patch["standard_id"]
+            for operation in patch.get("payload", {}).get("operations", []):
+                rule_type = operation.get("rule_type")
+                if operation.get("action") != "add" or rule_type not in prefixes:
+                    continue
+                key = (standard_id, rule_type)
+                if key not in next_ids:
+                    compiled = self.get_standard(standard_id)["compiled"]
+                    collection = (
+                        compiled["definition_rules"]
+                        if rule_type == "definition"
+                        else compiled["decision_rules"][f"{rule_type}_rules"]
+                    )
+                    prefix = prefixes[rule_type]
+                    numbers = [
+                        int(match.group(1)) for item in collection
+                        if (match := re.fullmatch(rf"{prefix}(\d+)", str(item.get("rule_id", ""))))
+                    ]
+                    next_ids[key] = max(numbers, default=0) + 1
+                generated_id = f"{prefixes[rule_type]}{next_ids[key]:03d}"
+                next_ids[key] += 1
+                operation["rule_id"] = generated_id
+                if isinstance(operation.get("after"), dict):
+                    operation["after"]["rule_id"] = generated_id
+        return results
 
     def update_suggestion_status(self, suggestion_id: str, status: str) -> Dict[str, Any]:
         if status not in {"open", "accepted", "dismissed"}:

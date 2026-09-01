@@ -766,9 +766,6 @@ function GapsPage({ runs, refresh, notify }: { runs: Run[]; refresh: () => Promi
   const [runId, setRunId] = useState(completed[0]?.id || '')
   const [suggestions, setSuggestions] = useState<Suggestion[]>([])
   const [busy, setBusy] = useState(false)
-  const [editing, setEditing] = useState<Suggestion | null>(null)
-  const [ruleJson, setRuleJson] = useState('')
-  const [reason, setReason] = useState('')
   const [patchEditing, setPatchEditing] = useState<Suggestion | null>(null)
   const [patchJson, setPatchJson] = useState('')
   const [patchReason, setPatchReason] = useState('')
@@ -788,34 +785,43 @@ function GapsPage({ runs, refresh, notify }: { runs: Run[]; refresh: () => Promi
     void loadSuggestions()
     return () => { cancelled = true }
   }, [runId, notify])
-  async function reviseAndRerun() {
-    if (!editing) return
-    const run = runs.find(value => value.id === editing.run_id); if (!run) return
-    setBusy(true)
-    try {
-      const newRule = JSON.parse(ruleJson)
-      const revised = await api.revise(run.standard_id, { rule_id: editing.payload.target_rule_id, new_rule: newRule, reason, related_case_ids: editing.case_ids, suggestion_id: editing.id })
-      await api.impactRun({ source_run_id: run.id, target_standard_id: revised.standard.id, rule_id: editing.payload.target_rule_id, labels: revised.affected_labels })
-      notify(`Standard v${revised.standard.version} 已生成，受影响数据开始重跑`); setEditing(null); await refresh()
-    } catch (error) { notify(error instanceof Error ? error.message : '修改失败', true) } finally { setBusy(false) }
-  }
-  async function approveAndApply(item: Suggestion) {
+  async function setPatchStatus(item: Suggestion, status: 'approved' | 'rejected' | 'proposed') {
     const patch = item.patch
-    if (!patch) { notify('该建议没有可审批的 Rule Patch', true); return }
+    if (!patch) return
     setBusy(true)
     try {
-      await api.updateRulePatch(patch.id, 'approved')
-      const result = await api.applyRulePatch(patch.id)
-      notify(`Rule Patch 已批准，Standard v${String((result.standard as { version: number }).version)} 已生成并开始重跑`)
+      await api.updateRulePatch(patch.id, status)
+      setSuggestions(await api.suggestions(runId || undefined))
+      notify(status === 'approved' ? 'Patch 已通过，可在全部审核完成后统一生成版本' : status === 'proposed' ? 'Patch 已恢复待审核，可继续编辑或重新审核' : 'Patch 已驳回')
+    } catch (error) { notify(error instanceof Error ? error.message : '更新 Patch 状态失败', true) } finally { setBusy(false) }
+  }
+  async function applyApproved() {
+    const approved = suggestions.map(item => item.patch).filter(patch => patch?.status === 'approved')
+    if (!approved.length) { notify('请先至少通过一条 Patch', true); return }
+    if (proposedCount > 0) { notify('请先审核完所有 Patch，再生成新的 Standard', true); return }
+    setBusy(true)
+    try {
+      const result = await api.batchApplyRulePatches(approved.map(patch => patch!.id))
+      const standard = result.standard as { version: number }
+      notify(`已基于当前 Standard 生成并激活 v${standard.version}，未自动重跑`)
       await refresh()
       setSuggestions(await api.suggestions(runId || undefined))
-    } catch (error) { notify(error instanceof Error ? error.message : 'Rule Patch 应用失败', true) } finally { setBusy(false) }
+    } catch (error) { notify(error instanceof Error ? error.message : '批量生成 Standard 失败', true) } finally { setBusy(false) }
   }
   function editPatch(item: Suggestion) {
     if (!item.patch) return
     setPatchEditing(item)
     setPatchJson(JSON.stringify(item.patch.payload.operations || [], null, 2))
     setPatchReason(String(item.patch.payload.reason || item.payload.proposed_change || ''))
+  }
+  function renderLaw(value: unknown) {
+    if (value == null) return <span className="law-empty">无</span>
+    return <pre className="law-text">{typeof value === 'string' ? value : JSON.stringify(value, null, 2)}</pre>
+  }
+  function operationLabel(operation: Record<string, unknown>) {
+    const type = operation.rule_type === 'boundary' ? '边界规则' : operation.rule_type === 'priority' ? '优先级规则' : '定义规则'
+    const action = operation.action === 'add' ? '新增' : operation.action === 'delete' ? '删除' : '修改'
+    return `${type}${action}`
   }
   async function savePatch() {
     if (!patchEditing?.patch) return
@@ -830,14 +836,42 @@ function GapsPage({ runs, refresh, notify }: { runs: Run[]; refresh: () => Promi
       })
       setPatchEditing(null)
       setSuggestions(await api.suggestions(runId || undefined))
-      notify('Rule Patch 已保存，可继续审核或一键生效')
+      notify('Rule Patch 已保存，可继续审核；全部完成后统一生成版本')
     } catch (error) { notify(error instanceof Error ? error.message : '保存 Patch 失败', true) } finally { setBusy(false) }
   }
+  const approvedCount = suggestions.filter(item => item.patch?.status === 'approved').length
+  const proposedCount = suggestions.filter(item => item.patch?.status === 'proposed').length
+  const sourceRun = runs.find(run => run.id === runId)
+  const editingPatch = patchEditing?.patch
+  const changeGroups: Array<{ action: string; label: string }> = [
+    { action: 'add', label: '新增规则' },
+    { action: 'update', label: '修改规则' },
+    { action: 'delete', label: '删除规则' },
+  ]
+  const renderSuggestion = (item: Suggestion) => {
+    const patch = item.patch
+    const operations = patch?.payload.operations || item.payload.operations || []
+    return <article className="suggestion" key={item.id}>
+      <div className="suggestion-head"><div className="suggestion-title"><h3>{item.payload.title}</h3><div className="list-meta"><Badge value={patch?.status || item.status} />{item.payload.labels.map(label => <span key={label}>{label}</span>)}{item.payload.target_rule_id && <span className="rule-chip">{item.payload.target_rule_id}</span>}</div></div><div className="actions suggestion-actions">{patch?.status === 'proposed' && <><button className="btn" disabled={busy} onClick={() => editPatch(item)}><Pencil size={14} />编辑</button><button className="btn" disabled={busy} onClick={() => void setPatchStatus(item, 'rejected')}><Trash2 size={14} />驳回</button><button className="btn primary" disabled={busy} onClick={() => void setPatchStatus(item, 'approved')}><Check size={14} />通过</button></>}{patch?.status === 'approved' && <button className="btn" disabled={busy} onClick={() => void setPatchStatus(item, 'proposed')}><X size={14} />撤回通过</button>}{patch?.status === 'rejected' && <button className="btn" disabled={busy} onClick={() => void setPatchStatus(item, 'proposed')}><RefreshCw size={14} />恢复待审核</button>}</div></div>
+      <div className="suggestion-copy"><p><b>问题</b>{item.payload.problem}</p><p><b>建议</b>{item.payload.proposed_change}</p></div>
+      <div className="law-section"><div className="law-section-title">具体法条 <span className="muted">{operations.length} 项变更</span></div>{operations.map((operation, index) => <div className="law-change" key={`${String(operation.rule_id || operation.after && (operation.after as Record<string, unknown>).rule_id || 'rule')}-${index}`}><div className="law-change-head"><span className="rule-chip">{String(operation.rule_id || (operation.after as Record<string, unknown> | undefined)?.rule_id || '未命名')}</span><span className="law-type">{operationLabel(operation)}</span></div><div className="law-columns"><div><strong>{operation.action === 'add' ? '原有规则（无）' : '原规则'}</strong>{renderLaw(operation.before)}</div><div><strong>{operation.action === 'delete' ? '删除后（无）' : operation.action === 'add' ? '新增规则' : '修改后规则'}</strong>{renderLaw(operation.after)}</div></div></div>)}</div>
+      {item.payload.typical_cases.length > 0 && <details className="case-details"><summary>关联案例（{item.payload.typical_cases.length}）</summary><ul className="case-list">{item.payload.typical_cases.map(value => <li key={value}>{value}</li>)}</ul></details>}
+    </article>
+  }
   return <>
-    <PageHead title="规则进化" meta={`${suggestions.length} 条待审批建议`}><select className="select" style={{ width: 260 }} value={runId} onChange={event => setRunId(event.target.value)}><option value="">选择已完成运行</option>{completed.map(run => <option key={run.id} value={run.id}>{run.dataset_name} · Standard v{run.standard_version}</option>)}</select></PageHead>
-    <div className="panel">{suggestions.length ? suggestions.map(item => <div className="suggestion" key={item.id}><div className="actions" style={{ justifyContent: 'space-between' }}><div><h3>{item.payload.title}</h3><div className="list-meta"><Badge value={item.patch?.status || item.status} />{item.payload.labels.map(label => <span key={label}>{label}</span>)}{item.payload.target_rule_id && <span className="rule-chip">{item.payload.target_rule_id}</span>}</div></div>{item.patch?.status === 'proposed' && <><button className="btn" disabled={busy} onClick={() => editPatch(item)}><Pencil size={14} />编辑 Patch</button><button className="btn primary" disabled={busy} onClick={() => void approveAndApply(item)}>批准 Patch 并生成 v2 <ArrowRight size={14} /></button></>}</div><p><b>问题：</b>{item.payload.problem}</p><p><b>建议：</b>{item.payload.proposed_change}</p><p className="muted">Patch 操作：{item.payload.operations?.length || 0} 个，必须人工批准后才会生成新 Standard。</p><ul className="case-list">{item.payload.typical_cases.map(value => <li key={value}>{value}</li>)}</ul></div>) : <Empty icon={Lightbulb} title="暂无 Rule Patch" />}</div>
-    {patchEditing && <Modal title="编辑 Rule Patch" onClose={() => !busy && setPatchEditing(null)} footer={<><button className="btn" disabled={busy} onClick={() => setPatchEditing(null)}>取消</button><button className="btn primary" disabled={busy || !patchReason.trim()} onClick={() => void savePatch()}>{busy ? <Spinner /> : <Save size={14} />}保存 Patch</button></>}><div className="notice">保存后仍需人工批准，批准后会从当前 Standard 生成新的版本，不会覆盖原版本。</div><div className="field"><label>Operations JSON</label><textarea className="textarea json" value={patchJson} onChange={event => setPatchJson(event.target.value)} /></div><div className="field"><label>Patch 原因</label><textarea className="textarea" value={patchReason} onChange={event => setPatchReason(event.target.value)} /></div></Modal>}
-    {editing && <Modal title={`修改 ${editing.payload.target_rule_id}`} onClose={() => !busy && setEditing(null)} footer={<><button className="btn" disabled={busy} onClick={() => setEditing(null)}>取消</button><button className="btn primary" disabled={busy || !reason.trim()} onClick={() => void reviseAndRerun()}>{busy ? <Spinner /> : <Play size={14} />}生成 v2 并重跑</button></>}><div className="notice">{editing.payload.proposed_change}</div><div className="field"><label>Rule JSON</label><textarea className="textarea json" value={ruleJson} onChange={event => setRuleJson(event.target.value)} /></div><div className="field"><label>修改原因</label><textarea className="textarea" value={reason} onChange={event => setReason(event.target.value)} /></div></Modal>}
+    <PageHead title="规则进化" meta={sourceRun ? `基于 Standard v${sourceRun.standard_version} · ${proposedCount} 待审核 · ${approvedCount} 已通过` : '选择一次已完成运行'}>
+      <div className="gaps-head-actions"><select className="select" value={runId} onChange={event => setRunId(event.target.value)}><option value="">选择已完成运行</option>{completed.map(run => <option key={run.id} value={run.id}>{run.dataset_name} · Standard v{run.standard_version}</option>)}</select><button className="btn primary" disabled={busy || approvedCount === 0 || proposedCount > 0} onClick={() => void applyApproved()}><Check size={14} />审核完成，生成新 Standard</button></div>
+    </PageHead>
+    <div className="notice gaps-notice">Patch 会先逐条审核，全部确认后一次性生成下一个 Standard。生成版本不会自动重跑，请在“标注运行”中手动创建任务；原 Standard 仍保留。</div>
+    <div className="panel gaps-panel">{suggestions.length ? changeGroups.map(group => {
+      const grouped = suggestions.filter(item => {
+        const operations = item.patch?.payload.operations || item.payload.operations || []
+        return operations.some(operation => operation.action === group.action)
+      })
+      if (!grouped.length) return null
+      return <section className="change-group" key={group.action}><div className="change-group-head"><h2>{group.label}</h2><span className="muted">{grouped.length} 个 Patch</span></div>{grouped.map(renderSuggestion)}</section>
+    }) : <Empty icon={Lightbulb} title="暂无 Rule Patch" />}</div>
+    {patchEditing && editingPatch && <Modal title="编辑 Rule Patch" onClose={() => !busy && setPatchEditing(null)} footer={<><button className="btn" disabled={busy} onClick={() => setPatchEditing(null)}>取消</button><button className="btn primary" disabled={busy || !patchReason.trim()} onClick={() => void savePatch()}>{busy ? <Spinner /> : <Save size={14} />}保存 Patch</button></>}><div className="notice">原规则用于对照，修改后内容会作为本次批次审核的最终法条。保存后仍需单独通过。</div><div className="patch-edit-preview">{(editingPatch.payload.operations || []).map((operation, index) => <div className="law-change" key={index}><div className="law-change-head"><span className="rule-chip">{String(operation.rule_id || (operation.after as Record<string, unknown> | undefined)?.rule_id || '未命名')}</span><span className="law-type">{operationLabel(operation)}</span></div><div className="law-columns"><div><strong>原规则（只读）</strong>{renderLaw(operation.before)}</div><div><strong>当前修改后法条</strong>{renderLaw(operation.after)}</div></div></div>)}</div><div className="field"><label>Operations JSON（可编辑 after）</label><textarea className="textarea json" value={patchJson} onChange={event => setPatchJson(event.target.value)} /></div><div className="field"><label>Patch 原因</label><textarea className="textarea" value={patchReason} onChange={event => setPatchReason(event.target.value)} /></div></Modal>}
   </>
 }
 

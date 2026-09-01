@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import logging
+import re
 import time
 from collections import Counter
 from contextlib import asynccontextmanager, nullcontext
@@ -1013,79 +1014,125 @@ class LabelSpecService:
         return {"standard": saved, "affected_labels": labels, "validation": result["validation"]}
 
     def apply_rule_patch(self, patch_id: str) -> Dict[str, Any]:
-        """Apply an approved Add/Update/Delete patch as a new immutable version."""
-        patch = self.store.get_rule_patch(patch_id)
-        if patch["status"] != "approved":
-            raise ValueError("Rule Patch 必须先经过人工批准，才能生成新 Standard")
-        current = self.store.get_standard(patch["standard_id"])
+        """Compatibility wrapper for applying one approved patch."""
+        return self.apply_rule_patches([patch_id])
+
+    def apply_rule_patches(self, patch_ids: Sequence[str]) -> Dict[str, Any]:
+        """Apply a reviewed batch as one immutable successor Standard."""
+        ids = list(dict.fromkeys(patch_ids))
+        if not ids:
+            raise ValueError("至少需要一个 Rule Patch")
+        patches = [self.store.get_rule_patch(patch_id) for patch_id in ids]
+        if any(patch["status"] != "approved" for patch in patches):
+            raise ValueError("所有 Rule Patch 必须先经过人工批准，才能生成新 Standard")
+        standard_ids = {patch["standard_id"] for patch in patches}
+        if len(standard_ids) != 1:
+            raise ValueError("同一批 Rule Patch 必须来自同一个 Standard")
+        standard_id = patches[0]["standard_id"]
+        selected = set(ids)
+        source_runs = {patch.get("source_run_id") for patch in patches if patch.get("source_run_id")}
+        pending = [
+            patch["id"] for patch in self.store.list_rule_patches(standard_id=standard_id)
+            if patch["status"] == "proposed"
+            and patch["id"] not in selected
+            and (not source_runs or patch.get("source_run_id") in source_runs)
+        ]
+        if pending:
+            raise ValueError("仍有未审核的 Rule Patch，请先逐条通过或驳回后再生成 Standard")
+        current = self.store.get_standard(standard_id)
         compiled = copy.deepcopy(current["compiled"])
-        operations = patch["payload"].get("operations", [])
-        if not operations:
-            raise ValueError("Rule Patch 没有可应用的 operations")
         affected: set[str] = set()
         changes: List[Tuple[str, Optional[Dict[str, Any]], Optional[Dict[str, Any]], List[str]]] = []
-        for operation in operations:
-            action = operation.get("action")
-            rule_type = operation.get("rule_type")
-            if rule_type not in {"definition", "boundary", "priority"}:
-                raise ValueError(f"不支持的 Rule 类型: {rule_type}")
+        deleted_types: set[str] = set()
+        for patch in patches:
+            operations = patch["payload"].get("operations", [])
+            if not operations:
+                raise ValueError("Rule Patch 没有可应用的 operations")
+            for operation in operations:
+                action = operation.get("action")
+                rule_type = operation.get("rule_type")
+                if rule_type not in {"definition", "boundary", "priority"}:
+                    raise ValueError(f"不支持的 Rule 类型: {rule_type}")
+                collection = (
+                    compiled["definition_rules"]
+                    if rule_type == "definition"
+                    else compiled["decision_rules"][f"{rule_type}_rules"]
+                )
+                after_value = operation.get("after")
+                rule_id = operation.get("rule_id") or (after_value or {}).get("rule_id")
+                before = next((item for item in collection if item.get("rule_id") == rule_id), None)
+                before_snapshot = copy.deepcopy(before)
+                labels_before = self._find_rule(compiled, rule_id)[1] if before is not None else []
+                if action == "add":
+                    after = copy.deepcopy(after_value)
+                    if not isinstance(after, dict):
+                        raise ValueError("新增 Rule 必须提供完整 after")
+                    prefix = {"definition": "D", "boundary": "B", "priority": "P"}[rule_type]
+                    numbers = [
+                        int(match.group(1)) for item in collection
+                        if (match := re.fullmatch(rf"{prefix}(\d+)", str(item.get("rule_id", ""))))
+                    ]
+                    rule_id = f"{prefix}{max(numbers, default=0) + 1:03d}"
+                    after["rule_id"] = rule_id
+                    collection.append(after)
+                elif action == "update":
+                    after = copy.deepcopy(after_value)
+                    if before is None or not isinstance(after, dict):
+                        raise ValueError(f"更新 Rule 不存在或缺少 after: {rule_id}")
+                    if after.get("rule_id") != rule_id:
+                        raise ValueError("更新后的 Rule 必须保留原 rule_id")
+                    before.clear()
+                    before.update(after)
+                elif action == "delete":
+                    if before is None:
+                        raise ValueError(f"删除 Rule 不存在: {rule_id}")
+                    collection.remove(before)
+                    after = None
+                    deleted_types.add(rule_type)
+                else:
+                    raise ValueError(f"不支持的 Patch 操作: {action}")
+                labels = self._find_rule(compiled, rule_id)[1] if action != "delete" else labels_before
+                affected.update(labels)
+                changes.append((rule_id, operation.get("before") if "before" in operation else before_snapshot, copy.deepcopy(after), labels))
+
+        # Deleting a rule compacts only that rule family. Existing order is kept,
+        # so B001/B003 becomes B001/B002 without changing unrelated D/P rules.
+        for rule_type in deleted_types:
             collection = (
                 compiled["definition_rules"]
                 if rule_type == "definition"
                 else compiled["decision_rules"][f"{rule_type}_rules"]
             )
-            rule_id = operation.get("rule_id") or operation.get("after", {}).get("rule_id")
-            before = next((item for item in collection if item.get("rule_id") == rule_id), None)
-            before_snapshot = copy.deepcopy(before)
-            if before is not None:
-                _, labels_before = self._find_rule(compiled, rule_id)
-            else:
-                labels_before = []
-            if action == "add":
-                after = copy.deepcopy(operation.get("after"))
-                if not isinstance(after, dict) or not after.get("rule_id"):
-                    raise ValueError("新增 Rule 必须提供完整 after 和 rule_id")
-                if any(item.get("rule_id") == after["rule_id"] for item in collection):
-                    raise ValueError(f"Rule ID 已存在: {after['rule_id']}")
-                collection.append(after)
-                rule_id = after["rule_id"]
-            elif action == "update":
-                after = copy.deepcopy(operation.get("after"))
-                if before is None or not isinstance(after, dict):
-                    raise ValueError(f"更新 Rule 不存在或缺少 after: {rule_id}")
-                if after.get("rule_id") != rule_id:
-                    raise ValueError("更新后的 Rule 必须保留原 rule_id")
-                before.clear()
-                before.update(after)
-            elif action == "delete":
-                if before is None:
-                    raise ValueError(f"删除 Rule 不存在: {rule_id}")
-                collection.remove(before)
-                after = None
-            else:
-                raise ValueError(f"不支持的 Patch 操作: {action}")
-            _, labels = self._find_rule(compiled, rule_id) if action != "delete" else (None, labels_before)
-            affected.update(labels)
-            changes.append((rule_id, operation.get("before") or before_snapshot, copy.deepcopy(after), labels))
+            prefix = {"definition": "D", "boundary": "B", "priority": "P"}[rule_type]
+            renames: Dict[str, str] = {}
+            for index, rule in enumerate(collection, start=1):
+                old_id = rule.get("rule_id")
+                new_id = f"{prefix}{index:03d}"
+                if old_id != new_id:
+                    renames[str(old_id)] = new_id
+                    rule["rule_id"] = new_id
+            if renames:
+                for index, (rule_id, before, after, labels) in enumerate(changes):
+                    if rule_id in renames:
+                        changes[index] = (renames[rule_id], before, after, labels)
 
         patch_report = validate_standard(CompiledStandard.model_validate(compiled))
         if not patch_report.valid:
             raise ValueError("Rule Patch 应用后 Standard 校验未通过，不能生效")
         result = self.create_manual_version(
-            patch["standard_id"],
+            standard_id,
             compiled,
-            patch["payload"].get("reason", "基于 Verifier 反馈应用 Rule Patch"),
+            "；".join(filter(None, [patch["payload"].get("reason") for patch in patches])) or "基于 Verifier 反馈应用 Rule Patch",
         )
         saved = result["standard"]
         for rule_id, before, after, _ in changes:
             self.store.record_rule_change(
-                patch["standard_id"], saved["id"], rule_id,
-                before or {}, after or {},
-                patch["payload"].get("reason", "基于 Verifier 反馈应用 Rule Patch"),
-                patch["related_feedback_ids"],
+                standard_id, saved["id"], rule_id, before or {}, after or {},
+                "批量应用 Rule Patch",
+                [feedback_id for patch in patches for feedback_id in patch["related_feedback_ids"]],
             )
-        self.store.update_rule_patch_status(patch_id, "applied", saved["id"])
-        return {**result, "affected_labels": sorted(affected), "patch": self.store.get_rule_patch(patch_id)}
+        applied = [self.store.update_rule_patch_status(patch["id"], "applied", saved["id"]) for patch in patches]
+        return {**result, "affected_labels": sorted(affected), "patches": applied, "patch": applied[0]}
 
     @staticmethod
     def _find_rule(compiled: Dict[str, Any], rule_id: str) -> Tuple[Dict[str, Any], List[str]]:

@@ -63,6 +63,7 @@ export const api = {
   rulePatches: (standardId?: string) => request<Array<Record<string, unknown>>>(`/api/rule-patches${standardId ? `?standard_id=${standardId}` : ''}`),
   updateRulePatch: (id: string, status?: string, payload?: Record<string, unknown>) => request<Record<string, unknown>>(`/api/rule-patches/${id}${status ? `?status=${encodeURIComponent(status)}` : ''}`, { method: 'PATCH', body: payload ? JSON.stringify({ payload }) : undefined }),
   applyRulePatch: (id: string) => request<Record<string, unknown>>(`/api/rule-patches/${id}/apply`, { method: 'POST' }),
+  batchApplyRulePatches: (patch_ids: string[]) => request<Record<string, unknown>>('/api/rule-patches/batch-apply', { method: 'POST', body: JSON.stringify({ patch_ids }) }),
   impactRun: (payload: unknown) => request<Run>('/api/impact-runs', { method: 'POST', body: JSON.stringify(payload) }),
   compare: (left: string, right: string) => request<{ left: { run: Run; metrics: import('./types').Metrics }; right: { run: Run; metrics: import('./types').Metrics } }>(`/api/compare?left_run_id=${left}&right_run_id=${right}`),
 }

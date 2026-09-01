@@ -248,16 +248,52 @@ tbody tr:hover { background: #fafbfa; }
 .label-picker-level { min-width: 0; }
 .label-picker-value { color: var(--primary-dark); font-weight: 650; }
 .label-picker-empty { min-height: 38px; display: flex; align-items: center; padding: 0 10px; border: 1px solid #e0c9a1; background: #fffbef; color: var(--amber); font-size: 12px; }
-.suggestion { padding: 16px; border-bottom: 1px solid var(--soft-line); }
+.gaps-head-actions { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; justify-content: flex-end; }
+.gaps-head-actions .select { width: min(300px, 42vw); }
+.gaps-notice { margin-bottom: 14px; line-height: 1.6; }
+.gaps-panel { min-width: 0; overflow: hidden; }
+.change-group { min-width: 0; border-bottom: 1px solid var(--line); }
+.change-group:last-child { border-bottom: 0; }
+.change-group-head { display: flex; align-items: baseline; gap: 9px; padding: 14px 18px 10px; background: #f7faf8; border-bottom: 1px solid var(--soft-line); }
+.change-group-head h2 { margin: 0; font-size: 13px; }
+.change-group .suggestion { padding-top: 15px; }
+.suggestion { min-width: 0; padding: 18px; border-bottom: 1px solid var(--soft-line); }
 .suggestion:last-child { border-bottom: 0; }
-.suggestion h3 { margin: 0; font-size: 14px; }
-.suggestion p { margin: 8px 0 0; color: #4e5752; font-size: 12px; line-height: 1.65; }
+.suggestion-head { min-width: 0; display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+.suggestion-title { min-width: 0; }
+.suggestion h3 { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
+.suggestion-actions { flex-shrink: 0; }
+.suggestion-copy { min-width: 0; }
+.suggestion p { margin: 8px 0 0; color: #4e5752; font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; }
+.suggestion p b { display: inline-block; min-width: 38px; margin-right: 5px; color: #27332d; }
+.law-section { min-width: 0; margin-top: 15px; padding: 13px; border: 1px solid var(--line); border-radius: 6px; background: #fbfdfb; }
+.law-section-title { display: flex; align-items: baseline; gap: 8px; font-size: 12px; font-weight: 720; }
+.law-change { min-width: 0; margin-top: 11px; padding-top: 11px; border-top: 1px solid var(--soft-line); }
+.law-change-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.law-type { color: var(--muted); font-size: 11px; }
+.law-columns { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; margin-top: 8px; }
+.law-columns > div { min-width: 0; padding: 9px 10px; border: 1px solid var(--soft-line); border-radius: 4px; background: white; }
+.law-columns strong { display: block; margin-bottom: 6px; color: var(--muted); font-size: 10px; }
+.law-text { max-width: 100%; max-height: 260px; margin: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: #39453e; font: 11px/1.6 "SFMono-Regular", Consolas, monospace; }
+.law-empty { color: var(--muted); font-size: 11px; }
+.patch-edit-preview { min-width: 0; max-height: 360px; overflow: auto; }
+.case-details { margin-top: 12px; font-size: 12px; }
+.case-details summary { cursor: pointer; color: var(--primary-dark); font-weight: 650; }
 .case-list { margin-top: 10px; padding-left: 18px; color: #58615c; font-size: 12px; line-height: 1.7; }
 .compare-grid { display: grid; grid-template-columns: 150px 1fr 1fr; font-size: 12px; }
 .compare-grid > div { padding: 10px 12px; border-bottom: 1px solid var(--soft-line); }
 .compare-head { background: #f7f9f7; font-weight: 680; }
 .positive { color: var(--primary-dark); font-weight: 680; }
 .negative { color: var(--red); font-weight: 680; }
+
+@media (max-width: 760px) {
+  .gaps-head-actions { justify-content: stretch; }
+  .gaps-head-actions .select { width: 100%; }
+  .gaps-head-actions .btn { flex: 1; }
+  .suggestion-head { display: grid; }
+  .suggestion-actions { justify-content: flex-start; }
+  .law-columns { grid-template-columns: 1fr; }
+}
 
 .modal.wide { width: min(1120px, 100%); }
 .standards-layout { grid-template-columns: minmax(250px, .65fr) minmax(0, 2fr); align-items: start; }

@@ -178,6 +178,11 @@ def test_rule_patch_creates_successor_without_overwriting_parent(store) -> None:
         },
         [],
     )
+    operation = patch["payload"]["operations"][0]
+    assert operation["before"]["rule_id"] == "D002"
+    assert operation["after"]["definition"] == "借款、利率、额度、还款、展期等贷款诉求"
+    assert list(operation["before"]) == ["rule_id", "label_id", "definition", "include", "exclude", "source_refs"]
+    assert list(operation["after"]) == ["rule_id", "label_id", "definition", "include", "exclude", "source_refs"]
     store.update_rule_patch_status(patch["id"], "approved")
     service = LabelSpecService(store, FragmentProvider())
     result = service.apply_rule_patch(patch["id"])
@@ -188,6 +193,115 @@ def test_rule_patch_creates_successor_without_overwriting_parent(store) -> None:
     assert second["status"] == "draft"
     assert store.get_standard(first["id"])["status"] == "active"
     assert store.get_standard(first["id"])["compiled"]["definition_rules"][1]["definition"] != second["compiled"]["definition_rules"][1]["definition"]
+
+
+def test_approved_patch_batch_creates_one_successor_and_keeps_parent(store) -> None:
+    first = store.create_standard("source", standard(), status="active")
+    patch_one = store.save_rule_patch(first["id"], {
+        "reason": "完善贷款定义", "operations": [{
+            "action": "update", "rule_type": "definition", "rule_id": "D002",
+            "after": {**first["compiled"]["definition_rules"][1], "definition": "更完整的贷款诉求"},
+        }],
+    }, [])
+    patch_two = store.save_rule_patch(first["id"], {
+        "reason": "完善购车定义", "operations": [{
+            "action": "update", "rule_type": "definition", "rule_id": "D004",
+            "after": {**first["compiled"]["definition_rules"][3], "definition": "更完整的购车诉求"},
+        }],
+    }, [])
+    store.update_rule_patch_status(patch_one["id"], "approved")
+    store.update_rule_patch_status(patch_two["id"], "approved")
+    service = LabelSpecService(store, FragmentProvider())
+
+    result = service.apply_rule_patches([patch_one["id"], patch_two["id"]])
+
+    second = result["standard"]
+    assert second["version"] == 2
+    assert second["parent_id"] == first["id"]
+    assert store.get_standard(first["id"])["status"] == "active"
+    assert len(store.list_standards()) == 2
+    assert {patch["applied_standard_id"] for patch in result["patches"]} == {second["id"]}
+    definitions = {rule["rule_id"]: rule["definition"] for rule in second["compiled"]["definition_rules"]}
+    assert definitions["D002"] == "更完整的贷款诉求"
+    assert definitions["D004"] == "更完整的购车诉求"
+
+
+def test_patch_batch_rejects_unapproved_or_different_standard(store) -> None:
+    first = store.create_standard("source", standard(), status="active")
+    second = store.create_standard("source", standard(), status="draft")
+    patch_one = store.save_rule_patch(first["id"], {"operations": [{
+        "action": "update", "rule_type": "boundary", "rule_id": "B001",
+        "after": {**first["compiled"]["decision_rules"]["boundary_rules"][0], "decision": "选贷款"},
+    }]}, [])
+    patch_two = store.save_rule_patch(second["id"], {"operations": [{
+        "action": "update", "rule_type": "boundary", "rule_id": "B001",
+        "after": {**second["compiled"]["decision_rules"]["boundary_rules"][0], "decision": "选购车"},
+    }]}, [])
+    store.update_rule_patch_status(patch_one["id"], "approved")
+    store.update_rule_patch_status(patch_two["id"], "approved")
+    service = LabelSpecService(store, FragmentProvider())
+    with pytest.raises(ValueError, match="同一批"):
+        service.apply_rule_patches([patch_one["id"], patch_two["id"]])
+    with pytest.raises(ValueError, match="人工批准"):
+        unapproved = store.save_rule_patch(first["id"], {"operations": [{
+            "action": "update", "rule_type": "priority", "rule_id": "P001",
+            "after": {**first["compiled"]["decision_rules"]["priority_rules"][0], "principle": "新的优先级"},
+        }]}, [])
+        service.apply_rule_patches([unapproved["id"]])
+
+
+def test_rule_patch_snapshots_add_and_delete_rules(store) -> None:
+    first = store.create_standard("source", standard(), status="active")
+    patch = store.save_rule_patch(first["id"], {"operations": [
+        {
+            "action": "add", "rule_type": "priority", "after": {
+                "rule_id": "P002", "principle": "新增优先级", "scope_label_id": None, "source_refs": [],
+            },
+        },
+        {"action": "delete", "rule_type": "boundary", "rule_id": "B001"},
+    ]}, [])
+    add, delete = patch["payload"]["operations"]
+    assert add["before"] is None
+    assert add["after"]["rule_id"] == "P002"
+    assert list(add["after"]) == ["rule_id", "principle", "scope_label_id", "source_refs"]
+    assert delete["before"]["rule_id"] == "B001"
+    assert delete["after"] is None
+
+
+def test_deleting_rule_compacts_remaining_rule_numbers(store) -> None:
+    value = standard()
+    value.decision_rules.boundary_rules.append(
+        value.decision_rules.boundary_rules[0].model_copy(update={"rule_id": "B002", "condition": "第二条边界"})
+    )
+    value.decision_rules.boundary_rules.append(
+        value.decision_rules.boundary_rules[0].model_copy(update={"rule_id": "B003", "condition": "第三条边界"})
+    )
+    first = store.create_standard("source", value, status="active")
+    patch = store.save_rule_patch(first["id"], {"operations": [{
+        "action": "delete", "rule_type": "boundary", "rule_id": "B002",
+    }]}, [])
+    store.update_rule_patch_status(patch["id"], "approved")
+    result = LabelSpecService(store, FragmentProvider()).apply_rule_patches([patch["id"]])
+    boundary_rules = result["standard"]["compiled"]["decision_rules"]["boundary_rules"]
+    assert [rule["rule_id"] for rule in boundary_rules] == ["B001", "B002"]
+    assert boundary_rules[1]["condition"] == "第三条边界"
+
+
+def test_multiple_added_rules_receive_sequential_ids(store) -> None:
+    first = store.create_standard("source", standard(), status="active")
+    patches = []
+    for condition in ("新增边界一", "新增边界二"):
+        patch = store.save_rule_patch(first["id"], {"operations": [{
+            "action": "add", "rule_type": "boundary", "after": {
+                "rule_id": "B999", "label_ids": ["L002", "L004"],
+                "condition": condition, "decision": "按核心诉求", "source_refs": [],
+            },
+        }]}, [])
+        store.update_rule_patch_status(patch["id"], "approved")
+        patches.append(patch["id"])
+    result = LabelSpecService(store, FragmentProvider()).apply_rule_patches(patches)
+    ids = [rule["rule_id"] for rule in result["standard"]["compiled"]["decision_rules"]["boundary_rules"]]
+    assert ids[-2:] == ["B002", "B003"]
 
 
 def test_manual_edit_keeps_conflicts_until_explicitly_resolved(store) -> None:
